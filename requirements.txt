@@ -1,0 +1,16 @@
+# Core AWS dependencies
+boto3>=1.38.0
+botocore>=1.29.0
+
+# Video processing dependencies
+ffmpeg-python>=0.2.0
+pydub>=0.25.1
+dotenv
+# Utility dependencies
+python-dotenv>=1.0.0
+python-dateutil>=2.9.0
+requests>=2.31.0
+urllib3>=1.26.18,<3.0.0
+tenacity>=8.2.0
+psutil>=5.9.0
+joblib>=1.3.0
