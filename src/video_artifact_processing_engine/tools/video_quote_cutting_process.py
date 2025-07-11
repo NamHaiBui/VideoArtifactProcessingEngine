@@ -1,22 +1,19 @@
-import tempfile
-from typing import List, Tuple
-import ffmpeg
-import os.path
-from datetime import datetime, timezone
-import logging
 import os
 import tempfile
+from typing import List, Tuple
+from datetime import datetime
 from botocore.exceptions import ClientError
 import ffmpeg
-from typing import List, Tuple
+import logging
+
 from ..models.quote_model import Quote
 from ..config import config
-from ..aws.aws_client import get_dynamodb_resource, get_s3_client
+from ..aws.aws_client import get_s3_client
+from ..db.db_operations import update_quote_video_url
 from ..utils.logging_config import setup_custom_logger
 
 logging = setup_custom_logger(__name__)
-# Initialize AWS clients
-dynamodb = get_dynamodb_resource()
+# Initialize AWS client
 s3_client = get_s3_client()
 
 def process_video_quotes(PK: str, 
@@ -69,38 +66,32 @@ def process_video_quotes(PK: str,
             for i, quote in enumerate(snippets_info):
                 try:
                     # Create a unique identifier for the quote
-                    quote_identifier = f"{quote.episode_title}_{quote.proverb_rank}"
+                    quote_identifier = f"{quote.episodeTitle}_{quote.quoteRank}"
                     logging.info(f"Processing quote {i+1}/{len(snippets_info)}: {quote_identifier}")
                     
                     # Skip quotes that already have a video URL
-                    if quote.quote_video_url and quote.quote_video_url.strip() and len(quote.quote_video_url.strip()) > 0:
+                    if quote.quoteAudioUrl and quote.quoteAudioUrl.strip() and len(quote.quoteAudioUrl.strip()) > 0:
                         logging.debug(f"Skipping quote {quote_identifier} - already has video URL")
                         continue
                     
-                    # Validate quote timestamps - try context first, fallback to proverb
+                    # Validate quote timestamps - try context first, fallback to quote
                     start_time = None
                     end_time = None
                     timestamp_source = None
-                    """"""
+                    
                     # Try context timestamps first (includes surrounding context)
-                    if hasattr(quote, 'context_timestamps') and \
-                       hasattr(quote.context_timestamps, 'start_time') and \
-                       hasattr(quote.context_timestamps, 'end_time') and \
-                       quote.context_timestamps.start_time != 0.0 and \
-                       quote.context_timestamps.end_time != 0.0:
-                        start_time = quote.context_timestamps.start_time
-                        end_time = quote.context_timestamps.end_time
+                    if quote.context_start_ms and quote.context_end_ms and \
+                       quote.context_start_ms > 0 and quote.context_end_ms > 0:
+                        start_time = quote.context_start_ms / 1000.0  # Convert ms to seconds
+                        end_time = quote.context_end_ms / 1000.0
                         timestamp_source = "context"
                     
-                    # Fallback to proverb timestamps if context not available
-                    elif hasattr(quote, 'proverb_timestamps') and \
-                         hasattr(quote.proverb_timestamps, 'start_time') and \
-                         hasattr(quote.proverb_timestamps, 'end_time') and \
-                         quote.proverb_timestamps.start_time != 0.0 and \
-                         quote.proverb_timestamps.end_time != 0.0:
-                        start_time = quote.proverb_timestamps.start_time
-                        end_time = quote.proverb_timestamps.end_time
-                        timestamp_source = "proverb"
+                    # Fallback to quote timestamps if context not available
+                    elif quote.quote_start_ms and quote.quote_end_ms and \
+                         quote.quote_start_ms > 0 and quote.quote_end_ms > 0:
+                        start_time = quote.quote_start_ms / 1000.0  # Convert ms to seconds
+                        end_time = quote.quote_end_ms / 1000.0
+                        timestamp_source = "quote"
                     
                     if start_time is None or end_time is None or timestamp_source is None:
                         logging.warning(f"Skipping quote {i+1} due to missing valid timestamps")
@@ -131,7 +122,7 @@ def process_video_quotes(PK: str,
                         continue
                     
                     # Prepare file paths
-                    quote_filename = f"{safe_episode_title}_quote_{quote.proverb_rank}.mp4"
+                    quote_filename = f"{safe_episode_title}_quote_{quote.quote_rank}.mp4"
                     quote_path = os.path.join(temp_dir, quote_filename)
                     s3_quote_key = f"{safe_podcast_title}/{safe_episode_title}/{quote_filename}"
 
@@ -173,8 +164,10 @@ def process_video_quotes(PK: str,
                         # Update quote with S3 video URL
                         try:
                             s3_video_url = f"https://{config.video_quote_bucket}.s3.amazonaws.com/{s3_quote_key}"
-                            update_quote_video_url(quote.pk, quote.sk, s3_video_url)
-                            logging.info(f"Updated database with video URL for quote {quote_identifier}")
+                            if update_quote_video_url(quote.quote_id, s3_video_url):
+                                logging.info(f"Updated database with video URL for quote {quote_identifier}")
+                            else:
+                                logging.error(f"Failed to update database with video URL for quote {quote_identifier}")
                         except Exception as e:
                             logging.error(f"Failed to update database with video URL for quote {quote_identifier}: {e}")
                             # Don't fail the entire process if database update fails
@@ -210,11 +203,11 @@ def process_video_quotes_with_path(full_video_path: str,
     for i, quote in enumerate(quotes_info):
         try:
             # Create a unique identifier for the quote
-            quote_identifier = f"{quote.episode_title}_{quote.proverb_rank}"
+            quote_identifier = f"{quote.episode_title}_{quote.quote_rank}"
             logging.info(f"Processing quote {i+1}/{len(quotes_info)}: {quote_identifier}")
             
             # Skip quotes that already have a video URL
-            if quote.quote_video_url and quote.quote_video_url.strip() and len(quote.quote_video_url.strip()) > 0:
+            if quote.quote_audio_url and quote.quote_audio_url.strip() and len(quote.quote_audio_url.strip()) > 0:
                 logging.debug(f"Skipping quote {quote_identifier} - already has video URL")
                 continue
             
@@ -224,24 +217,18 @@ def process_video_quotes_with_path(full_video_path: str,
             timestamp_source = None
             
             # Try context timestamps first (includes surrounding context)
-            if hasattr(quote, 'context_timestamps') and \
-               hasattr(quote.context_timestamps, 'start_time') and \
-               hasattr(quote.context_timestamps, 'end_time') and \
-               quote.context_timestamps.start_time != 0.0 and \
-               quote.context_timestamps.end_time != 0.0:
-                start_time = quote.context_timestamps.start_time
-                end_time = quote.context_timestamps.end_time
+            if quote.context_start_ms and quote.context_end_ms and \
+               quote.context_start_ms > 0 and quote.context_end_ms > 0:
+                start_time = quote.context_start_ms / 1000.0  # Convert ms to seconds
+                end_time = quote.context_end_ms / 1000.0
                 timestamp_source = "context"
             
-            # Fallback to proverb timestamps if context not available
-            elif hasattr(quote, 'proverb_timestamps') and \
-                 hasattr(quote.proverb_timestamps, 'start_time') and \
-                 hasattr(quote.proverb_timestamps, 'end_time') and \
-                 quote.proverb_timestamps.start_time != 0.0 and \
-                 quote.proverb_timestamps.end_time != 0.0:
-                start_time = quote.proverb_timestamps.start_time
-                end_time = quote.proverb_timestamps.end_time
-                timestamp_source = "proverb"
+            # Fallback to quote timestamps if context not available
+            elif quote.quote_start_ms and quote.quote_end_ms and \
+                 quote.quote_start_ms > 0 and quote.quote_end_ms > 0:
+                start_time = quote.quote_start_ms / 1000.0  # Convert ms to seconds
+                end_time = quote.quote_end_ms / 1000.0
+                timestamp_source = "quote"
             
             if start_time is None or end_time is None or timestamp_source is None:
                 logging.warning(f"Skipping quote {i+1} due to missing valid timestamps")
@@ -272,7 +259,7 @@ def process_video_quotes_with_path(full_video_path: str,
                 continue
             
             # Prepare file paths
-            quote_filename = f"{safe_episode_title}_quote_{quote.proverb_rank}.mp4"
+            quote_filename = f"{safe_episode_title}_quote_{quote.quoteRank}.mp4"
             quote_path = os.path.join(temp_dir, quote_filename)
             s3_quote_key = f"{safe_podcast_title}/{safe_episode_title}/{quote_filename}"  # Include podcast/episode subfolders
 
@@ -314,8 +301,10 @@ def process_video_quotes_with_path(full_video_path: str,
                 # Update quote with S3 video URL
                 try:
                     s3_video_url = f"https://{config.video_quote_bucket}.s3.amazonaws.com/{s3_quote_key}"
-                    update_quote_video_url(quote.pk, quote.sk, s3_video_url)
-                    logging.info(f"Updated database with video URL for quote {quote_identifier}")
+                    if update_quote_video_url(quote.quote_id, s3_video_url):
+                        logging.info(f"Updated database with video URL for quote {quote_identifier}")
+                    else:
+                        logging.error(f"Failed to update database with video URL for quote {quote_identifier}")
                 except Exception as e:
                     logging.error(f"Failed to update database with video URL for quote {quote_identifier}: {e}")
                     # Don't fail the entire process if database update fails
@@ -332,79 +321,6 @@ def process_video_quotes_with_path(full_video_path: str,
     return successful_uploads
 
 
-def update_quote_video_url(quote_pk: str, quote_sk: str, video_url: str):
-    """Update the quote with the S3 video URL using new schema.
-    Updates both the full quote record and all associated simplified genre records.
-    """
-    if not quote_pk or not quote_sk or not video_url:
-        raise ValueError("quote_pk, quote_sk, and video_url cannot be empty")
-        
-    try:
-        quotes_table = dynamodb.Table(config.quotes_table)
-        
-        # Update the main quote record
-        response = quotes_table.update_item(
-            Key={
-                'PK': quote_pk,
-                'SK': quote_sk
-            },
-            UpdateExpression='SET quoteVideoUrl = :video_url , updatedAt = :updated_at',
-            ExpressionAttributeValues={
-                ':video_url': video_url,
-                ':updated_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-            },
-            ReturnValues='UPDATED_NEW'
-        )
-        logging.info(f"Updated quoteVideoUrl for main record {quote_pk}/{quote_sk}")
-        
-        # Extract quote ID from the main SK (format: DATE#timestamp#QUOTE#uuid)
-        quote_id = None
-        if '#QUOTE#' in quote_sk:
-            quote_id = quote_sk.split('#QUOTE#')[1]
-        
-        if quote_id:
-            # Query for all simplified records with this quote ID
-            # SK pattern: QUOTE#uuid#GENRE#genre_uuid
-            from boto3.dynamodb.conditions import Key
-            
-            simplified_records_response = quotes_table.query(
-                KeyConditionExpression=Key('PK').eq(quote_pk) & Key('SK').begins_with(f'QUOTE#{quote_id}#GENRE#'),
-                ProjectionExpression='SK'
-            )
-            
-            simplified_records = simplified_records_response.get('Items', [])
-            
-            if simplified_records:
-                logging.info(f"Found {len(simplified_records)} simplified genre records to update")
-                
-                # Update each simplified record
-                for record in simplified_records:
-                    simplified_sk = record['SK']
-                    try:
-                        quotes_table.update_item(
-                            Key={
-                                'PK': quote_pk,
-                                'SK': simplified_sk
-                            },
-                            UpdateExpression='SET quoteVideoUrl = :video_url , updatedAt = :updated_at',
-                            ExpressionAttributeValues={
-                                ':video_url': video_url,
-                                ':updated_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-                            }
-                        )
-                        logging.debug(f"Updated simplified record {quote_pk}/{simplified_sk}")
-                    except ClientError as e:
-                        logging.warning(f"Failed to update simplified record {simplified_sk}: {e}")
-                        # Continue with other records even if one fails
-                
-                logging.info(f"Updated video URL for main quote and {len(simplified_records)} simplified records")
-            else:
-                logging.info("No simplified genre records found to update")
-        else:
-            logging.warning(f"Could not extract quote ID from SK: {quote_sk}")
-        
-        return response
-        
-    except ClientError as e:
-        logging.error(f"Error updating quote video URL: {e}")
-        raise e
+"""Quote processing has been moved to use RDS instead of DynamoDB.
+Database operations are now in db_operations.py
+"""

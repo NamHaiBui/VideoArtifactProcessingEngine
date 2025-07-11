@@ -6,16 +6,15 @@ import ffmpeg
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone
 
-from ..models.chunk_model import Chunk
+from ..models.shorts_model import Short
 from ..models.quote_model import Quote
 from ..config import config
-from ..aws.aws_client import get_dynamodb_resource, get_s3_client
-from ..aws.db_operations import update_chunk_video_url_all_records
+from ..aws.aws_client import get_s3_client
+from ..db.db_operations import update_short_video_url
 from ..utils.logging_config import setup_custom_logger
 
 logging = setup_custom_logger(__name__)
 
-dynamodb = get_dynamodb_resource()
 s3_client = get_s3_client()
 
 def check_if_exists_in_s3(bucket_name, s3_chunk_key):
@@ -39,7 +38,7 @@ def process_video_chunks(PK: str,
                          podcast_title: str,
                          episode_title: str,
                          s3_video_key: str,
-                         chunks_info: List[Chunk], 
+                         chunks_info: List[Short], 
                          overwrite: bool = True) -> List[Tuple[str, str]]:
     """
     Simple sequential video chunk processing.
@@ -84,11 +83,10 @@ def process_video_chunks(PK: str,
                 try:
                     logging.info(f"Processing chunk {i+1}/{len(chunks_info)}: {chunk.chunk_id}")
                     
-                    # Extract timestamps
-                    time_stamps = chunk.time_stamps
+                    # Extract timestamps from Short model
                     try:
-                        start_time = float(time_stamps.get('start', 0)) / 1000.0 if time_stamps.get('start') is not None else None
-                        end_time = float(time_stamps.get('end', 0)) / 1000.0 if time_stamps.get('end') is not None else None
+                        start_time = float(chunk.start_ms) / 1000.0 if chunk.start_ms is not None else None
+                        end_time = float(chunk.end_ms) / 1000.0 if chunk.end_ms is not None else None
                     except (ValueError, TypeError) as e:
                         logging.warning(f"Skipping chunk {i+1} due to invalid timestamps: {e}")
                         continue
@@ -120,7 +118,7 @@ def process_video_chunks(PK: str,
                         # Still update the database with the S3 URL
                         try:
                             s3_video_url = f"https://{config.video_chunk_bucket}.s3.amazonaws.com/{s3_chunk_key}"
-                            update_chunk_video_url_all_records(chunk.episode_id, chunk.chunk_id, s3_video_url)
+                            update_short_video_url(chunk.chunk_id, s3_video_url)
                             logging.info(f"Updated database with video URL for existing chunk {chunk.chunk_id}")
                         except Exception as e:
                             logging.error(f"Failed to update database with video URL for existing chunk {chunk.chunk_id}: {e}")
@@ -165,7 +163,7 @@ def process_video_chunks(PK: str,
                         # Update chunk with S3 video URL
                         try:
                             s3_video_url = f"https://{config.video_chunk_bucket}.s3.amazonaws.com/{s3_chunk_key}"
-                            update_chunk_video_url_all_records(chunk.episode_id, chunk.chunk_id, s3_video_url)
+                            update_short_video_url(chunk.chunk_id, s3_video_url)
                             logging.info(f"Updated database with video URL for chunk {chunk.chunk_id}")
                         except Exception as e:
                             logging.error(f"Failed to update database with video URL for chunk {chunk.chunk_id}: {e}")
@@ -195,7 +193,7 @@ def process_video_chunks_with_path(full_video_path: str,
                                   SK: str,
                                   safe_podcast_title: str,
                                   safe_episode_title: str,
-                                  chunks_info: List[Chunk],
+                                  chunks_info: List[Short],
                                   overwrite: bool = True) -> List[Tuple[str, str]]:
     """
     Process video chunks using an already downloaded video file.
@@ -206,11 +204,10 @@ def process_video_chunks_with_path(full_video_path: str,
         try:
             logging.info(f"Processing chunk {i+1}/{len(chunks_info)}: {chunk.chunk_id}")
             
-            # Extract timestamps
-            time_stamps = chunk.time_stamps
+            # Extract timestamps from Short model
             try:
-                start_time = float(time_stamps.get('start', 0)) / 1000.0 if time_stamps.get('start') is not None else None
-                end_time = float(time_stamps.get('end', 0)) / 1000.0 if time_stamps.get('end') is not None else None
+                start_time = float(chunk.start_ms) / 1000.0 if chunk.start_ms is not None else None
+                end_time = float(chunk.end_ms) / 1000.0 if chunk.end_ms is not None else None
             except (ValueError, TypeError) as e:
                 logging.warning(f"Skipping chunk {i+1} due to invalid timestamps: {e}")
                 continue
@@ -242,7 +239,7 @@ def process_video_chunks_with_path(full_video_path: str,
                 # Still update the database with the S3 URL
                 try:
                     s3_video_url = f"https://{config.video_chunk_bucket}.s3.amazonaws.com/{s3_chunk_key}"
-                    update_chunk_video_url_all_records(chunk.episode_id, chunk.chunk_id, s3_video_url)
+                    update_short_video_url(chunk.chunk_id, s3_video_url)
                     logging.info(f"Updated database with video URL for existing chunk {chunk.chunk_id}")
                 except Exception as e:
                     logging.error(f"Failed to update database with video URL for existing chunk {chunk.chunk_id}: {e}")
@@ -287,7 +284,7 @@ def process_video_chunks_with_path(full_video_path: str,
                 # Update chunk with S3 video URL
                 try:
                     s3_video_url = f"https://{config.video_chunk_bucket}.s3.amazonaws.com/{s3_chunk_key}"
-                    update_chunk_video_url_all_records(chunk.episode_id, chunk.chunk_id, s3_video_url)
+                    update_short_video_url(chunk.chunk_id, s3_video_url)
                     logging.info(f"Updated database with video URL for chunk {chunk.chunk_id}")
                 except Exception as e:
                     logging.error(f"Failed to update database with video URL for chunk {chunk.chunk_id}: {e}")

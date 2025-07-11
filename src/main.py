@@ -4,10 +4,9 @@ import os
 import sys
 import time
 import uuid
-from boto3.dynamodb.conditions import Key
 
-from video_artifact_processing_engine.aws.aws_client import get_sqs_client, get_dynamodb_resource, validate_aws_credentials
-from video_artifact_processing_engine.aws.db_operations import get_all_quotes, get_quotes_video_status, update_quote_video_status, get_all_chunks, get_video_chunking_status, update_video_chunking_status
+from video_artifact_processing_engine.aws.aws_client import get_sqs_client, validate_aws_credentials
+from video_artifact_processing_engine.db.db_operations import get_episode_by_id, get_quotes_by_episode_id, get_shorts_by_episode_id, check_episode_chunking_status
 from video_artifact_processing_engine.tools.video_artifacts_cutting_process import process_video_artifacts_unified
 from video_artifact_processing_engine.utils.logging_config import setup_custom_logger
 from video_artifact_processing_engine.config import config
@@ -128,64 +127,50 @@ def process_sqs_message(message_body, message_id):
             session.processing_status = 'failed'
             return {'success': False, 'error': 'No metadata ID found', 'session_id': session.session_id}
         
-        logger.info(f"Processing video artifacts for ID: {meta_data_idx}")
+        logger.info(f"Processing video artifacts for episode ID: {meta_data_idx}")
         session.set_result('meta_data_idx', meta_data_idx)
         session.processing_status = 'processing'
         
-        # Initialize DynamoDB
-        dynamodb = get_dynamodb_resource()
-        
         # Process the video artifacts
-        logger.info(f"Starting video artifact generation for PK: {meta_data_idx}")
+        logger.info(f"Starting video artifact generation for episode ID: {meta_data_idx}")
         
-        metadata_table = dynamodb.Table(config.podcast_metadata_table)
-        logger.info(f"Using DynamoDB table: {config.podcast_metadata_table}")
-
-        # meta_data_idx is the PK, so we can directly query the item
-        PK = str(meta_data_idx)
-        logger.info(f"Querying DynamoDB with PK: {PK}")
+        episode_id = str(meta_data_idx)
+        logger.info(f"Querying RDS for episode: {episode_id}")
         
-        # Query to get the metadata item
+        # Query to get the episode metadata
         try:
-            response = metadata_table.query(
-                KeyConditionExpression=Key('PK').eq(PK) & Key('SK').begins_with('CHANNEL#')
-            )
-            logger.info(f"DynamoDB query successful. Items found: {len(response.get('Items', []))}")
+            episode_item = get_episode_by_id(episode_id)
+            logger.info(f"RDS query successful. Episode found: {episode_item is not None}")
         except Exception as e:
-            logger.error(f"DynamoDB query failed: {e}")
-            logger.error(f"Query details - PK: {PK}, Table: {config.podcast_metadata_table}")
+            logger.error(f"RDS query failed: {e}")
+            logger.error(f"Query details - episode_id: {episode_id}")
             raise
         
-        if not response.get('Items'):
-            logger.warning(f"No metadata item found for PK: {PK}")
+        if not episode_item:
+            logger.warning(f"No episode found for ID: {episode_id}")
             session.processing_status = 'failed'
-            return {'success': False, 'error': 'No metadata found', 'session_id': session.session_id}
+            return {'success': False, 'error': 'No episode found', 'session_id': session.session_id}
             
-        # Get the first (and should be only) metadata item
-        item = response['Items'][0]
-        SK = str(item.get('SK', ''))
-        
         # Check for chunking_status first - this applies to both chunks and quotes processing
-        if item.get('chunkingStatus', '') != 'COMPLETED':
-            logger.info(f"Chunking not completed for PK: {PK}, skipping video processing")
+        chunking_status = check_episode_chunking_status(episode_id)
+        if chunking_status != 'COMPLETED':
+            logger.info(f"Chunking not completed for episode {episode_id}, skipping video processing")
             session.processing_status = 'skipped'
             return {'success': True, 'skipped': True, 'reason': 'Chunking not completed', 'session_id': session.session_id}
         
-        episode_id = str(item.get('episodeId', ''))
-        episode_title_details = str(item.get('episodeTitleDetails', ''))
+        episode_title_details = str(episode_item.get('episode_title_details', ''))
+        s3_video_key = str(episode_item.get('video_file_name', ''))
         
-        s3_video_key = str(item.get('videoFileName', ''))
-        
-        podcast_title = str(item.get('podcastTitle', item.get('podcast_title', '')))
+        podcast_title = str(episode_item.get('podcast_title', ''))
         if not podcast_title:
             # Extract podcast name from fileName path
-            file_name = item.get('fileName', '')
+            file_name = episode_item.get('file_name', '')
             if file_name and '/' in file_name:
                 podcast_title = file_name.split('/')[0]
             else:
                 podcast_title = "Unknown Podcast"
                 
-        episode_title = str(item.get('episodeTitleDetails', ''))
+        episode_title = str(episode_item.get('episode_title_details', ''))
         if not episode_title:
             episode_title = episode_title_details
 
@@ -201,19 +186,19 @@ def process_sqs_message(message_body, message_id):
             return {'success': False, 'error': 'No video file found', 'session_id': session.session_id}
         
         # Retrieve quotes for processing
-        all_quotes = get_all_quotes(episode_id, force_video_quotes=force_video_quote)
-        quotes = [x for x in all_quotes if x.proverb and x.proverb.strip() and x.context and x.context.strip()]
+        all_quotes = get_quotes_by_episode_id(episode_id)
+        quotes = [x for x in all_quotes if x.quote and x.quote.strip() and x.context and x.context.strip()]
 
         # Log quote information for debugging
         if all_quotes:
-            quote_lengths = [x.context_length for x in all_quotes]
+            quote_lengths = [x.context_length or 0 for x in all_quotes]
             logger.info(f"Quote lengths: min={min(quote_lengths)}, max={max(quote_lengths)}, avg={sum(quote_lengths)/len(quote_lengths):.2f}")
             zero_length_count = sum(1 for x in quote_lengths if x == 0.0)
             logger.info(f"Quotes with 0.0 length: {zero_length_count}/{len(all_quotes)}")
 
         # Retrieve chunks for processing
-        all_chunks = get_all_chunks(episode_id, force_video_chunking=force_video_chunking)
-        chunks = [x for x in all_chunks if x.chunk and x.chunk.strip()]
+        all_chunks = get_shorts_by_episode_id(episode_id)
+        chunks = [x for x in all_chunks if x.transcript and x.transcript.strip()]
         
         # Log chunk information for debugging
         if all_chunks:
@@ -226,35 +211,26 @@ def process_sqs_message(message_body, message_id):
         num_chunks = len(chunks)
 
         logger.info(f"Processing episode {episode_id} ({episode_title_details}) - {num_quotes} quotes, {num_chunks} chunks")
-        logger.info(f"Using PK: {PK}, SK: {SK}")
         logger.info(f"File naming: Podcast='{podcast_title}', Episode='{episode_title}'")
         logger.info(f"Video source: {s3_video_key}")
-        logger.info(f"Chunking status: {item.get('chunkingStatus', 'UNKNOWN')} - proceeding with video processing")
+        logger.info(f"Chunking status: {chunking_status} - proceeding with video processing")
         
 
-        logger.info(f"Retrieved {len(quotes)} quotes and {len(chunks)} chunks for PK: {PK}")
+        logger.info(f"Retrieved {len(quotes)} quotes and {len(chunks)} chunks for episode: {episode_id}")
 
         # Process Video Artifacts (both quotes and chunks) in unified way
         if quotes or chunks:
             logging.info(f"Starting unified video artifact processing...")
             
-            # Check status for both types
-            quotes_video_status = get_quotes_video_status(PK, SK) if quotes else 'COMPLETED'
-            video_chunking_status = get_video_chunking_status(PK, SK) if chunks else 'COMPLETED'
-            
-            should_process_quotes = quotes and (quotes_video_status != 'COMPLETED' or force_video_quote)
-            should_process_chunks = chunks and (video_chunking_status != 'COMPLETED' or force_video_chunking)
+            should_process_quotes = quotes and force_video_quote
+            should_process_chunks = chunks and force_video_chunking
             
             if should_process_quotes or should_process_chunks:
-                # Update status to IN_PROGRESS for items being processed
-                if should_process_quotes:
-                    update_quote_video_status(PK, SK, 'IN_PROGRESS')
-                
                 try:
                     # Use unified processing function
                     results = process_video_artifacts_unified(
-                        PK=PK,
-                        SK=SK,
+                        PK=episode_id,
+                        SK=f"CHANNEL#{episode_item.get('channel_id', 'default')}",
                         podcast_title=podcast_title,
                         episode_title=episode_title,
                         s3_video_key=s3_video_key,
@@ -266,28 +242,24 @@ def process_sqs_message(message_body, message_id):
                     video_quote_paths = results.get('quotes', [])
                     video_chunk_paths = results.get('chunks', [])
                     
-                    # Update status based on results
+                    # Log results
                     if should_process_quotes:
                         if len(video_quote_paths) >= 0:
-                            update_quote_video_status(PK, SK, 'COMPLETED')
                             logging.info(f"Video quote processing completed: {len(video_quote_paths)} quotes")
                             if len(video_quote_paths) != num_quotes:
                                 logging.warning(f"Quote count mismatch: {len(video_quote_paths)} != {num_quotes}")
                         else:
-                            update_quote_video_status(PK, SK, 'FAILED')
                             logging.error(f"No quotes processed successfully")
                     
                     if should_process_chunks:
                         if len(video_chunk_paths) == int(num_chunks):
                             logger.info(f"Video chunking completed: {len(video_chunk_paths)} chunks")
-                            update_video_chunking_status(PK, SK, 'COMPLETED')
                         else:
                             logger.warning(f"Chunk count mismatch: {len(video_chunk_paths)} != {num_chunks}")
                         
                 except Exception as e:
                     if should_process_quotes:
                         logging.error(f"Video quote processing failed: {e}")
-                        update_quote_video_status(PK, SK, 'FAILED')
                     if should_process_chunks:
                         logger.error(f"Video chunk processing failed: {e}")
                     raise
@@ -304,9 +276,7 @@ def process_sqs_message(message_body, message_id):
         metadata = {
             'podcast_title': podcast_title,
             'episode_title': episode_title,
-            'episode_id': episode_id,
-            'PK': PK,
-            'SK': SK
+            'episode_id': episode_id
         }
         
         logger.info(f"Successfully processed video artifacts for {metadata.get('podcast_title', 'Unknown')}/{metadata.get('episode_title', 'Unknown')}")

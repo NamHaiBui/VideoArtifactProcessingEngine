@@ -57,8 +57,8 @@ class SQSPoller:
             self.sqs = boto3.client(
                 'sqs',
                 region_name=self.config.general_aws_region,
-                aws_access_key_id=self.config.dynamodb_access_key_id,
-                aws_secret_access_key=self.config.dynamodb_secret_access_key
+                aws_access_key_id=self.config.aws_access_key_id,
+                aws_secret_access_key=self.config.aws_secret_access_key
             )
         except NoCredentialsError:
             logger.error("AWS credentials not found. Please configure AWS credentials.")

@@ -3,8 +3,8 @@ import os
 import tempfile
 from typing import Dict, List, Optional, Tuple
 from video_artifact_processing_engine.config import config
-from video_artifact_processing_engine.aws.aws_client import get_dynamodb_resource, get_s3_client
-from video_artifact_processing_engine.models.chunk_model import Chunk
+from video_artifact_processing_engine.aws.aws_client import get_s3_client
+from video_artifact_processing_engine.models.shorts_model import Short
 from video_artifact_processing_engine.models.quote_model import Quote
 from video_artifact_processing_engine.tools.video_quote_cutting_process import process_video_quotes_with_path
 from video_artifact_processing_engine.tools.video_short_cutting_process import process_video_chunks_with_path
@@ -14,14 +14,13 @@ from botocore.exceptions import ClientError
 
 from video_artifact_processing_engine.utils.logging_config import setup_custom_logger
 logging = setup_custom_logger(__name__)
-dynamodb = get_dynamodb_resource()
 s3_client = get_s3_client()
 def process_video_artifacts_unified(PK: str,
                                    SK: str,
                                    podcast_title: str,
                                    episode_title: str,
                                    s3_video_key: str,
-                                   chunks_info: Optional[List[Chunk]] = None, 
+                                   chunks_info: Optional[List[Short]] = None, 
                                    quotes_info: Optional[List[Quote]] = None,
                                    overwrite: bool = True) -> Dict[str, List[Tuple[str, str]]]:
     """
