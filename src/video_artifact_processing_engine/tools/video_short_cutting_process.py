@@ -229,7 +229,7 @@ def process_video_chunks_with_path(full_video_path: str,
             # Prepare file paths using podcast and episode titles
             chunk_filename = f"{chunk.chunk_id}.mp4"
             chunk_path = os.path.join(temp_dir, chunk_filename)
-            s3_chunk_key = f"{safe_podcast_title}/{safe_episode_title}/{chunk_filename}"
+            s3_chunk_key = f"{safe_podcast_title}/{safe_episode_title}/video/{chunk_filename}"
             
             # Check if already exists in S3
             if not overwrite and check_if_exists_in_s3(config.video_chunk_bucket, s3_chunk_key):

@@ -259,9 +259,9 @@ def process_video_quotes_with_path(full_video_path: str,
                 continue
             
             # Prepare file paths
-            quote_filename = f"{safe_episode_title}_quote_{quote.quoteRank}.mp4"
+            quote_filename = f"{safe_episode_title}_quote_{quote.quote_rank}.mp4"
             quote_path = os.path.join(temp_dir, quote_filename)
-            s3_quote_key = f"{safe_podcast_title}/{safe_episode_title}/{quote_filename}"  # Include podcast/episode subfolders
+            s3_quote_key = f"{safe_podcast_title}/{safe_episode_title}/video/{quote_filename}"  # Include podcast/episode subfolders
 
             # Process with FFmpeg
             logging.info(f"Processing quote {quote_filename}: {start_time:.2f}s to {end_time:.2f}s")
@@ -307,7 +307,7 @@ def process_video_quotes_with_path(full_video_path: str,
                         logging.error(f"Failed to update database with video URL for quote {quote_identifier}")
                 except Exception as e:
                     logging.error(f"Failed to update database with video URL for quote {quote_identifier}: {e}")
-                    # Don't fail the entire process if database update fails
+                    # Don't fail the entire process if database update 
                 
             except ClientError as e:
                 logging.error(f"Failed to upload {quote_filename}: {e}")
