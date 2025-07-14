@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# Local development
+.env
+/tests
+requirements-dev.txt
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Other
+README.md

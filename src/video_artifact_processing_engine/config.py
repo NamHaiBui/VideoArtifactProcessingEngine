@@ -22,7 +22,7 @@ class Config:
         self.db_password = os.environ.get('DB_PASSWORD', '')
         self.db_pool_min_size = int(os.environ.get('DB_POOL_MIN_SIZE', '1'))
         self.db_pool_max_size = int(os.environ.get('DB_POOL_MAX_SIZE', '10'))
-
+    
         # Log Level
         self.log_level = os.environ.get('LOG_LEVEL', 'INFO')
         self.max_concurrent_processing = int(os.environ.get('MAX_CONCURRENT_PROCESSING', '3'))
@@ -36,11 +36,11 @@ class Config:
         self.general_aws_region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 
         # S3 Bucket Configuration
-        self.video_bucket = os.environ.get("VIDEO_BUCKET", "pd-video-storage-test")
+        self.video_bucket = os.environ.get("VIDEO_BUCKET",  'spice-episode-artifacts')
         self.summary_transcript_bucket = os.environ.get("SUMMARY_TRANSCRIPT_BUCKET", "pd-summary-transcript-storage")
         self.video_quote_bucket = os.environ.get("VIDEO_QUOTES_CHUNK_BUCKET", "pd-video-quotes-storage")
         self.video_chunk_bucket = os.environ.get("CHUNK_VIDEO_BUCKET", "pd-video-chunks-storage")
-        self.video_summary_bucket = os.environ.get("VIDEO_SUMMARY_BUCKET", "pd-video-summary-storage")
+        self.video_summary_bucket = os.environ.get("VIDEO_SUMMARY_BUCKET",  'spice-episode-artifacts')
         self.s3_bucket_name = os.environ.get("S3_BUCKET_NAME", self.video_bucket)
         self.s3_input_prefix = os.environ.get("S3_INPUT_PREFIX", "input/")
         self.s3_output_prefix = os.environ.get("S3_OUTPUT_PREFIX", "output/")

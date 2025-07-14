@@ -13,7 +13,7 @@ from video_artifact_processing_engine.utils.logging_config import setup_custom_l
 logger = setup_custom_logger(__name__)
 
 # Import configuration
-from ..config import config
+from video_artifact_processing_engine.config import config
 
 
 
@@ -142,3 +142,19 @@ def validate_aws_credentials():
             'error': str(e),
             'sources': []
         }
+class S3Service:
+    def __init__(self):
+        self.client = get_s3_client()
+        self.region = config.general_aws_region
+
+    def upload_file(self, file_path: str, bucket: str, key: str):
+        content_type = 'application/octet-stream'
+        if key.endswith('.m3u8'):
+            content_type = 'application/vnd.apple.mpegurl'
+        elif key.endswith(('.mp4', '.m4s')):
+            content_type = 'video/mp4'
+        
+        self.client.upload_file(file_path, bucket, key, ExtraArgs={'ContentType': content_type})
+
+    def get_public_url(self, bucket: str, key: str) -> str:
+        return f"https://{bucket}.s3.{config.general_aws_region}.amazonaws.com/{key}"

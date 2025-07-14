@@ -1,16 +1,21 @@
-"""My Python Project
+"""
+Video Chunk Processing Package
 
-A simple Python project with hello world functionality.
+A Python package for processing video files into chunks with various processing capabilities.
+Includes SQS polling and ECS deployment support for scalable cloud processing.
 """
 
-from .utils import hello_world, print_welcome_message, get_system_info
+__version__ = "1.0.0"
+__author__ = "Nam Bui"
+__email__ = "namhbui03@gmail.com"
 
-__version__ = "0.1.0"
-__author__ = "Your Name"
-__email__ = "your.email@example.com"
+from .config import Config
+from .sqs_handler import SQSPoller, VideoProcessingMessage
+from .utils.logging_config import setup_custom_logger as SetupLogging
 
 __all__ = [
-    "hello_world",
-    "print_welcome_message", 
-    "get_system_info",
+    "Config", 
+    "SQSPoller", 
+    "VideoProcessingMessage",
+    "SetupLogging"
 ]

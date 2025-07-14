@@ -1,3 +1,4 @@
+import asyncio
 import boto3
 import json
 import os
@@ -6,8 +7,9 @@ import time
 import uuid
 
 from video_artifact_processing_engine.aws.aws_client import get_sqs_client, validate_aws_credentials
-from video_artifact_processing_engine.db.db_operations import get_episode_by_id, get_quotes_by_episode_id, get_shorts_by_episode_id, check_episode_chunking_status
+from video_artifact_processing_engine.aws.db_operations import get_episode_by_id, get_episode_processing_status, get_quotes_by_episode_id, get_shorts_by_episode_id
 from video_artifact_processing_engine.tools.video_artifacts_cutting_process import process_video_artifacts_unified
+from video_artifact_processing_engine.utils import parse_s3_url
 from video_artifact_processing_engine.utils.logging_config import setup_custom_logger
 from video_artifact_processing_engine.config import config
 # Set up logging
@@ -64,7 +66,7 @@ class ProcessingSession:
 
 def create_processing_session():
     """Create a new processing session for sequential processing"""
-    session_id = str(uuid.uuid4())[:8]  # Short session ID
+    session_id = str(uuid.uuid4())[:8]  
     return ProcessingSession(session_id)
 
 # Validate AWS credentials before proceeding
@@ -88,7 +90,7 @@ logging.info(f"Credential sources: {credential_status.get('sources')}")
 sqs = get_sqs_client()
 logging.info("Using AWS SQS endpoint")
     
-def process_sqs_message(message_body, message_id):
+async def process_sqs_message(message_body, message_id):
     """
     Process a single SQS message sequentially.
     
@@ -117,8 +119,10 @@ def process_sqs_message(message_body, message_id):
         session.processing_status = 'parsing'
         
         # Extract metadata ID (adjust key name based on your message structure)
-        meta_data_idx = message_data.get('id') or message_data.get('meta_data_idx') or message_data.get('episode_id')
-        force_video_quote = message_data.get('force_video_quote', True)
+        meta_data_idx = message_data.get('id','')
+        if not meta_data_idx:
+            return {'success': False, 'error': 'No metadata ID found', 'session_id': session.session_id}
+        force_video_quoting = message_data.get('force_video_quoting', True)
         force_video_chunking = message_data.get('force_video_chunking', True)
 
         if not meta_data_idx:
@@ -152,88 +156,87 @@ def process_sqs_message(message_body, message_id):
             return {'success': False, 'error': 'No episode found', 'session_id': session.session_id}
             
         # Check for chunking_status first - this applies to both chunks and quotes processing
-        chunking_status = check_episode_chunking_status(episode_id)
-        if chunking_status != 'COMPLETED':
-            logger.info(f"Chunking not completed for episode {episode_id}, skipping video processing")
-            session.processing_status = 'skipped'
-            return {'success': True, 'skipped': True, 'reason': 'Chunking not completed', 'session_id': session.session_id}
+        processing_info = get_episode_processing_status(episode_id)
+        if not processing_info:
+            logger.error(f"No chunking status found for episode: {episode_id}")
+            session.processing_status = 'failed'
+            return {'success': False, 'error': 'No chunking status found', 'session_id': session.session_id}
         
-        episode_title_details = str(episode_item.get('episode_title_details', ''))
-        s3_video_key = str(episode_item.get('video_file_name', ''))
-        
-        podcast_title = str(episode_item.get('podcast_title', ''))
-        if not podcast_title:
-            # Extract podcast name from fileName path
-            file_name = episode_item.get('file_name', '')
-            if file_name and '/' in file_name:
-                podcast_title = file_name.split('/')[0]
-            else:
-                podcast_title = "Unknown Podcast"
-                
-        episode_title = str(episode_item.get('episode_title_details', ''))
-        if not episode_title:
-            episode_title = episode_title_details
-
-        # Validate that we have the necessary data for processing
+        episode_title = episode_item.episode_title
+        s3_http_link = episode_item.additional_data.get("videoLocation")
+        logger.info(f"Episode title: {episode_item.additional_data}")
+        podcast_title = str(episode_item.channel_name)
+        if not s3_http_link:
+            logger.error(f"No videoLocation found for episode {episode_id}")
+            session.processing_status = 'failed'
+            return {'success': False, 'error': 'No videoLocation found', 'session_id': session.session_id}
+        s3_parsed = parse_s3_url(s3_http_link)
+        s3_key = s3_parsed['path'] if s3_parsed else None
+        s3_video_bucket = s3_parsed['bucket'] if s3_parsed else None
+        if s3_video_bucket and s3_video_bucket != config.video_bucket:
+            logger.warning(f"Episode video bucket '{s3_video_bucket}' does not match configured video bucket '{config.video_bucket}'")
+        logger.info(f"Parsed S3 video key: {s3_key}")
+        # s3_key_prefix = 
         if not podcast_title or not episode_title:
             logger.error(f"Missing required titles: podcast_title='{podcast_title}', episode_title='{episode_title}'")
             session.processing_status = 'failed'
             return {'success': False, 'error': 'Missing required titles', 'session_id': session.session_id}
             
-        if not s3_video_key:
+        if not s3_key:
             logger.error(f"No video file found for episode {episode_id}")
             session.processing_status = 'failed'
             return {'success': False, 'error': 'No video file found', 'session_id': session.session_id}
-        
-        # Retrieve quotes for processing
-        all_quotes = get_quotes_by_episode_id(episode_id)
-        quotes = [x for x in all_quotes if x.quote and x.quote.strip() and x.context and x.context.strip()]
+        quotes = []
+        if not processing_info.get("quotingDone"):
+            # Retrieve quotes for processing
+            all_quotes = get_quotes_by_episode_id(episode_id)
+            quotes = [x for x in all_quotes if x.quote and x.quote.strip() and x.context and x.context.strip()]
 
-        # Log quote information for debugging
-        if all_quotes:
-            quote_lengths = [x.context_length or 0 for x in all_quotes]
-            logger.info(f"Quote lengths: min={min(quote_lengths)}, max={max(quote_lengths)}, avg={sum(quote_lengths)/len(quote_lengths):.2f}")
-            zero_length_count = sum(1 for x in quote_lengths if x == 0.0)
-            logger.info(f"Quotes with 0.0 length: {zero_length_count}/{len(all_quotes)}")
-
-        # Retrieve chunks for processing
-        all_chunks = get_shorts_by_episode_id(episode_id)
-        chunks = [x for x in all_chunks if x.transcript and x.transcript.strip()]
-        
-        # Log chunk information for debugging
-        if all_chunks:
-            chunk_lengths = [x.chunk_length for x in all_chunks]
-            logger.info(f"Chunk lengths: min={min(chunk_lengths)}, max={max(chunk_lengths)}, avg={sum(chunk_lengths)/len(chunk_lengths):.2f}")
-            zero_length_count = sum(1 for x in chunk_lengths if x == 0.0)
-            logger.info(f"Chunks with 0.0 length: {zero_length_count}/{len(all_chunks)}")
+            # Log quote information for debugging
+            if all_quotes:
+                quote_lengths = [x.quote_length or 0 for x in all_quotes]
+                logger.info(f"Quote lengths: min={min(quote_lengths)}, max={max(quote_lengths)}, avg={sum(quote_lengths)/len(quote_lengths):.2f}")
+                zero_length_count = sum(1 for x in quote_lengths if x == 0.0)
+                logger.info(f"Quotes with 0.0 length: {zero_length_count}/{len(all_quotes)}")
+        chunks = []
+        if  not processing_info.get("chunkingDone"):
+            # Retrieve chunks for processing
+            all_chunks = get_shorts_by_episode_id(episode_id)
+            chunks = [x for x in all_chunks if x.transcript and x.transcript.strip()]
+            
+            # Log chunk information for debugging
+            if all_chunks:
+                chunk_lengths = [x.chunk_length or 0 for x in all_chunks]
+                logger.info(f"Chunk lengths: min={min(chunk_lengths)}, max={max(chunk_lengths)}, avg={sum(chunk_lengths)/len(chunk_lengths):.2f}")
+                zero_length_count = sum(1 for x in chunk_lengths if x == 0.0)
+                logger.info(f"Chunks with 0.0 length: {zero_length_count}/{len(all_chunks)}")
 
         num_quotes = len(quotes)
         num_chunks = len(chunks)
 
-        logger.info(f"Processing episode {episode_id} ({episode_title_details}) - {num_quotes} quotes, {num_chunks} chunks")
+        logger.info(f"Processing episode {episode_id}, ({episode_title}) - {num_quotes} quotes, {num_chunks} chunks")
         logger.info(f"File naming: Podcast='{podcast_title}', Episode='{episode_title}'")
-        logger.info(f"Video source: {s3_video_key}")
-        logger.info(f"Chunking status: {chunking_status} - proceeding with video processing")
+        logger.info(f"Video source: {s3_key}")
+        logger.info(f"Chunking status: {processing_info} - proceeding with video processing")
         
 
         logger.info(f"Retrieved {len(quotes)} quotes and {len(chunks)} chunks for episode: {episode_id}")
 
         # Process Video Artifacts (both quotes and chunks) in unified way
         if quotes or chunks:
+        # if False:
             logging.info(f"Starting unified video artifact processing...")
             
-            should_process_quotes = quotes and force_video_quote
+            should_process_quotes = quotes and force_video_quoting
             should_process_chunks = chunks and force_video_chunking
             
             if should_process_quotes or should_process_chunks:
                 try:
-                    # Use unified processing function
-                    results = process_video_artifacts_unified(
-                        PK=episode_id,
-                        SK=f"CHANNEL#{episode_item.get('channel_id', 'default')}",
+                    results = await process_video_artifacts_unified(
+                        episode_id=episode_id,
                         podcast_title=podcast_title,
                         episode_title=episode_title,
-                        s3_video_key=s3_video_key,
+                        s3_video_key_prefix=s3_key,  
                         chunks_info=chunks if should_process_chunks else None,
                         quotes_info=quotes if should_process_quotes else None,
                         overwrite=True
@@ -431,7 +434,7 @@ def log_processing_stats():
                 f"Failed: {failed}, "
                 f"Success Rate: {success_rate:.1f}%")
 
-def main():
+async def main():
     """
     Main function for direct execution with command line arguments.
     Used for single message processing (legacy mode).
@@ -460,6 +463,7 @@ def main():
         event = json.loads(event_data)
         meta_data_idx = event["id"]
         force_video_chunking = bool(event.get("force_video_chunk_process", True))
+        force_video_quoting = bool(event.get("force_video_quoting_process", True))
 
     except KeyError as e:
         print(f"Missing key in event data: {e}")
@@ -474,10 +478,11 @@ def main():
         # Create a message body and process using the same logic as SQS
         message_body = json.dumps({
             'id': meta_data_idx,
-            'force_video_chunking': force_video_chunking
+            'force_video_chunking': force_video_chunking,   
+            'force_video_quoting': force_video_quoting,
         })
         
-        result = process_sqs_message(message_body, f"direct-{meta_data_idx}")
+        result = await process_sqs_message(message_body, f"direct-{meta_data_idx}")
         
         if result.get('success'):
             logging.info(f"Video processing completed for {meta_data_idx}")
@@ -501,6 +506,6 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1].startswith('{'):
-        main()
+        asyncio.run(main())
     else:
         poll_and_process_sqs_messages()
