@@ -173,6 +173,11 @@ async def process_sqs_message(message_body, message_id):
         s3_parsed = parse_s3_url(s3_http_link)
         s3_key = s3_parsed['path'] if s3_parsed else None
         s3_video_bucket = s3_parsed['bucket'] if s3_parsed else None
+        s3_video_key = s3_key + s3_parsed['filename'] if s3_parsed and s3_key else None
+        if not s3_video_key:
+            logger.error(f"No video key found for episode {episode_id}")
+            session.processing_status = 'failed'
+            return {'success': False, 'error': 'No video key found', 'session_id': session.session_id}
         if s3_video_bucket and s3_video_bucket != config.video_bucket:
             logger.warning(f"Episode video bucket '{s3_video_bucket}' does not match configured video bucket '{config.video_bucket}'")
         logger.info(f"Parsed S3 video key: {s3_key}")
@@ -236,7 +241,8 @@ async def process_sqs_message(message_body, message_id):
                         episode_id=episode_id,
                         podcast_title=podcast_title,
                         episode_title=episode_title,
-                        s3_video_key_prefix=s3_key,  
+                        s3_video_key=s3_video_key,
+                        s3_video_key_prefix=s3_key,
                         chunks_info=chunks if should_process_chunks else None,
                         quotes_info=quotes if should_process_quotes else None,
                         overwrite=True
@@ -310,7 +316,7 @@ async def process_sqs_message(message_body, message_id):
         session.cleanup()
         session.cleanup()
 
-def poll_and_process_sqs_messages():
+async def poll_and_process_sqs_messages():
     """
     Main loop to poll SQS messages and process them sequentially.
     This prevents duplicate job execution.
@@ -353,7 +359,7 @@ def poll_and_process_sqs_messages():
                     
                     # Process message sequentially
                     logging.info(f"Processing message {message_id} sequentially")
-                    result = process_sqs_message(message_body, message_id)
+                    result = await process_sqs_message(message_body, message_id)
                     
                     # Handle the result and cleanup
                     handle_completed_message(result, message_id, receipt_handle)
@@ -508,4 +514,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1].startswith('{'):
         asyncio.run(main())
     else:
-        poll_and_process_sqs_messages()
+        asyncio.run(poll_and_process_sqs_messages())

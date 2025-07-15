@@ -156,5 +156,5 @@ class S3Service:
         
         self.client.upload_file(file_path, bucket, key, ExtraArgs={'ContentType': content_type})
 
-    def get_public_url(self, bucket: str, key: str) -> str:
-        return f"https://{bucket}.s3.{config.general_aws_region}.amazonaws.com/{key}"
+def get_public_url(bucket: str, key: str) -> str:
+    return f"https://{bucket}.s3.{config.general_aws_region}.amazonaws.com/{key}"

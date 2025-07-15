@@ -4,42 +4,45 @@ from datetime import datetime
 
 @dataclass
 class Short:
-    chunk_id: str
-    chunk_title: Optional[str] = None
-    chunk_descriptive_title: Optional[str] = None
-    chunk_description: Optional[str] = None
-    chunk_length: Optional[int] = None
-    episode_id: Optional[str] = None
-    channel_id: Optional[str] = None
-    genre: Optional[str] = None
-    chunk_audio_url: Optional[str] = None
-    transcript: Optional[str] = None
-    end_ms: Optional[int] = None
+    chunk_id: str = ''
+    chunk_title: Optional[str] = ''
+    chunk_descriptive_title: Optional[str] = ''
+    chunk_description: Optional[str] = ''
+    chunk_length: Optional[int] = 0
+    episode_id: Optional[str] = ''
+    channel_id: Optional[str] = ''
+    genre: Optional[str] = ''
+    chunk_audio_url: Optional[str] = ''
+    transcript: Optional[str] = ''
+    end_ms: Optional[int] = 0
     published_date: Optional[datetime] = None
-    sentiment: Optional[str] = None
-    speakers: Optional[List[str]] = None
-    start_ms: Optional[int] = None
-    topics: Optional[List[str]] = None
-    podcast_title: Optional[str] = None
-    episode_title: Optional[str] = None
-    guests: Optional[List[str]] = None
-    guests_description: Optional[List[str]] = None
-    host: Optional[str] = None
-    host_description: Optional[str] = None
+    sentiment: Optional[str] = ''
+    speakers: Optional[List[str]] = field(default_factory=list)
+    start_ms: Optional[int] = 0
+    topics: Optional[List[str]] = field(default_factory=list)
+    podcast_title: Optional[str] = ''
+    episode_title: Optional[str] = ''
+    guests: Optional[List[str]] = field(default_factory=list)
+    guests_description: Optional[List[str]] = field(default_factory=list)
+    host: Optional[str] = ''
+    host_description: Optional[str] = ''
     is_synced: bool = False
     is_used_in_summary: bool = False
-    transcript_uri: Optional[str] = None
+    transcript_uri: Optional[str] = ''
     content_type: Optional[str] = "Audio"
     additional_data: Dict[str, Any] = field(default_factory=dict)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
-    genre_id: Optional[str] = None
-    guest_ids: Optional[List[str]] = None
-    host_id: Optional[str] = None
+    genre_id: Optional[str] = ''
+    guest_ids: Optional[List[str]] = field(default_factory=list)
+    host_id: Optional[str] = ''
 
     @classmethod
     def from_db_record(cls, record: Dict[str, Any]) -> 'Short':
+        additional_data = record.get("additionalData", {})
+        if additional_data is None:
+            additional_data = {}
         return cls(
             chunk_id=record["chunkId"],
             chunk_title=record.get("chunkTitle"),
@@ -67,7 +70,7 @@ class Short:
             is_used_in_summary=record.get("isUsedInSummary", False),
             transcript_uri=record.get("transcriptUri"),
             content_type=record.get("contentType", "Audio"),
-            additional_data=record.get("additionalData", {}),
+            additional_data=additional_data,
             created_at=record.get("createdAt"),
             updated_at=record.get("updatedAt"),
             deleted_at=record.get("deletedAt"),

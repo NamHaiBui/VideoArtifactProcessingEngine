@@ -17,7 +17,6 @@ venv/
 .idea/
 
 # Local development
-.env
 /tests
 requirements-dev.txt
 

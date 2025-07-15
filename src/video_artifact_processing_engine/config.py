@@ -37,9 +37,9 @@ class Config:
 
         # S3 Bucket Configuration
         self.video_bucket = os.environ.get("VIDEO_BUCKET",  'spice-episode-artifacts')
-        self.summary_transcript_bucket = os.environ.get("SUMMARY_TRANSCRIPT_BUCKET", "pd-summary-transcript-storage")
-        self.video_quote_bucket = os.environ.get("VIDEO_QUOTES_CHUNK_BUCKET", "pd-video-quotes-storage")
-        self.video_chunk_bucket = os.environ.get("CHUNK_VIDEO_BUCKET", "pd-video-chunks-storage")
+        self.summary_transcript_bucket = os.environ.get("SUMMARY_TRANSCRIPT_BUCKET", "spice-episode-artifacts")
+        self.video_quote_bucket = os.environ.get("QUOTE_BUCKET", "spice-quote-artifacts")
+        self.video_chunk_bucket = os.environ.get("CHUNK_BUCKET", "spice-short-artifacts")
         self.video_summary_bucket = os.environ.get("VIDEO_SUMMARY_BUCKET",  'spice-episode-artifacts')
         self.s3_bucket_name = os.environ.get("S3_BUCKET_NAME", self.video_bucket)
         self.s3_input_prefix = os.environ.get("S3_INPUT_PREFIX", "input/")

@@ -60,13 +60,15 @@ async def process_video_chunks_with_path(
             s3_hls_prefix = f"{safe_podcast_title}/{safe_episode_title}/shorts/{chunk.chunk_id}/hls/"
             hls_url, all_s3_keys = await hls_converter.upload_hls_to_s3(hls_output_dir, s3_hls_prefix, config.video_chunk_bucket)
             
-            s3_client.upload_file(chunk_path, config.video_chunk_bucket, s3_chunk_key, ExtraArgs={'ContentType': 'video/mp4', 'ACL': 'private'})
+            s3_client.upload_file(chunk_path, config.video_chunk_bucket, s3_chunk_key, ExtraArgs={'ContentType': 'video/mp4'})
             if 'videoChunkPath' not in chunk.additional_data:
-                chunk.additional_data['videoChunkPath'] = []
-            chunk.additional_data['videoChunkPath'].extend(f"https://{config.video_chunk_bucket}.s3.us-east-1.amazonaws.com/{s3_chunk_key}")
-
+                chunk.additional_data['videoChunkPath'] = ""
+            chunk.additional_data['videoChunkPath'] += f"https://{config.video_chunk_bucket}.s3.us-east-1.amazonaws.com/{s3_chunk_key}"
+            if 'videoMasterPlaylistPath' not in chunk.additional_data:
+                chunk.additional_data['videoMasterPlaylistPath'] = ""
+            chunk.additional_data['videoMasterPlaylistPath'] += hls_url
             # Update the main URL field with the master playlist
-            await update_short_video_url(chunk.chunk_id, hls_url)
+            # await update_short_video_url(chunk.chunk_id, hls_url)
             await update_short(chunk)
             successful_uploads.append({'chunk_id': chunk.chunk_id, 'hls_url': hls_url})
             logging.info(f"Uploaded HLS for chunk {chunk.chunk_id} to {hls_url}")

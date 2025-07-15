@@ -66,21 +66,25 @@ async def process_video_quotes_with_path(
 
             hls_output_dir = os.path.join(temp_dir, f"episode_{quote.episode_id}_hls_quote_{quote.quote_id}_{definition_name}")
             await hls_converter.transcode_to_hls(quote_path, hls_output_dir)
-
-            s3_hls_prefix = f"{safe_podcast_title}/{safe_episode_title}/quotes/{quote.quote_id}/hls/"
+            logging.info(f"Transcoded quote {quote.quote_id} to HLS at {hls_output_dir}")
+            s3_hls_prefix = f"{safe_podcast_title}/{safe_episode_title}/quotes/{quote.quote_id}/hls"
             hls_url, all_s3_keys = await hls_converter.upload_hls_to_s3(hls_output_dir, s3_hls_prefix, config.video_quote_bucket)
-            s3_client.upload_file(quote_path, config.video_quote_bucket, s3_quote_key, ExtraArgs={'ContentType': 'video/mp4', 'ACL': 'public-read'})
-            
+            s3_client.upload_file(quote_path, config.video_quote_bucket, s3_quote_key, ExtraArgs={'ContentType': 'video/mp4'})
+            logging.info(f"Uploaded quote video file to S3 at {s3_quote_key}")
             # Update the main URL field with the master playlist
             await update_quote_video_url(quote.quote_id, hls_url)
-            
+            logging.info(f"Updated quote {quote.quote_id} in DB with new video URL")
             # Append all HLS paths to additionalData
             if 'videoQuotePath' not in quote.additional_data:
-                quote.additional_data['videoQuotePath'] = []
-            quote.additional_data['videoQuotePath'].extend(f"https://{config.video_chunk_bucket}.s3.us-east-1.amazonaws.com/{s3_quote_key}")
-
+                quote.additional_data['videoQuotePath'] = ""
+            # logging.info(f"Current additional_data for quote {quote.quote_id}: {quote.additional_data}")
+            quote.additional_data['videoQuotePath'] += f"https://{config.video_quote_bucket}.s3.us-east-1.amazonaws.com/{s3_quote_key}"
+            # logging.info(f"Added videoQuotePath for quote {quote.quote_id}: https://{config.video_quote_bucket}.s3.us-east-1.amazonaws.com/{s3_quote_key}")
+            if 'videoMasterPlaylistPath' not in quote.additional_data:
+                quote.additional_data['videoMasterPlaylistPath'] = ""
+            quote.additional_data['videoMasterPlaylistPath'] += hls_url
             await update_quote(quote)
-
+            logging.info(f"Updated quote {quote.quote_id} in DB with new video URL and additional data.")
             successful_uploads.append({'quote_id': quote.quote_id, 'hls_url': hls_url})
             logging.info(f"Uploaded HLS for quote {quote.quote_id} to {hls_url}")
 

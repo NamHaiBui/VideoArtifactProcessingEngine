@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import logging
@@ -7,31 +8,31 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Quote:
-    quote_id: str
-    quote: str
-    channel_id: str
-    episode_id: str
-    context: Optional[str] = None
-    context_start_ms: Optional[int] = None
-    context_end_ms: Optional[int] = None
-    quote_start_ms: Optional[int] = None
-    quote_end_ms: Optional[int] = None
-    episode_title: Optional[str] = None
-    podcast_title: Optional[str] = None
-    genre: Optional[str] = None
-    guests_name: Optional[str] = None
-    guests_description: Optional[str] = None
-    quote_length: Optional[int] = None
-    quote_rank: Optional[int] = None
+    quote_id: str = ''
+    quote: str = ''
+    channel_id: str = ''
+    episode_id: str = ''
+    context: Optional[str] = ''
+    context_start_ms: Optional[int] = 0
+    context_end_ms: Optional[int] = 0
+    quote_start_ms: Optional[int] = 0
+    quote_end_ms: Optional[int] = 0
+    episode_title: Optional[str] = ''
+    podcast_title: Optional[str] = ''
+    genre: Optional[str] = ''
+    guests_name: Optional[str] = ''
+    guests_description: Optional[str] = ''
+    quote_length: Optional[int] = 0
+    quote_rank: Optional[int] = 0
     published_date: Optional[datetime] = None
-    quote_audio_url: Optional[str] = None
-    sentiment: Optional[str] = None
-    speaker_label: Optional[str] = None
-    speaker_name: Optional[str] = None
-    topic: Optional[str] = None
-    quote_description: Optional[str] = None
+    quote_audio_url: Optional[str] = ''
+    sentiment: Optional[str] = ''
+    speaker_label: Optional[str] = ''
+    speaker_name: Optional[str] = ''
+    topic: Optional[str] = ''
+    quote_description: Optional[str] = ''
     is_synced: bool = False
-    transcript_uri: Optional[Dict[str, Any]] = None
+    transcript_uri: Optional[Dict[str, Any]] = field(default_factory=dict)
     content_type: str = 'Audio'
     additional_data: Dict[str, Any] = field(default_factory=dict)
     created_at: Optional[datetime] = None
@@ -40,6 +41,9 @@ class Quote:
 
     @classmethod
     def from_db_row(cls, row: Dict[str, Any]) -> 'Quote':
+        additional_data = row.get('additionalData', {})
+        if additional_data is None:
+            additional_data = {}
         return cls(
             quote_id=row['quoteId'],
             quote=row['quote'],
@@ -67,7 +71,7 @@ class Quote:
             is_synced=row.get('isSynced', False),
             transcript_uri=row.get('transcriptUri'),
             content_type=row.get('contentType', 'Audio'),
-            additional_data=row.get('additionalData', {}),
+            additional_data=additional_data,
             created_at=row.get('createdAt'),
             updated_at=row.get('updatedAt'),
             deleted_at=row.get('deletedAt')
@@ -99,9 +103,9 @@ class Quote:
             'topic': self.topic,
             'quoteDescription': self.quote_description,
             'isSynced': self.is_synced,
-            'transcriptUri': self.transcript_uri,
+            'transcriptUri': json.dumps(self.transcript_uri) if self.transcript_uri is not None else None,
             'contentType': self.content_type,
-            'additionalData': self.additional_data,
+            'additionalData': json.dumps(self.additional_data) if self.additional_data is not None else None,
             'createdAt': self.created_at,
             'updatedAt': self.updated_at,
             'deletedAt': self.deleted_at
