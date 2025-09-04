@@ -23,6 +23,3 @@ requirements-dev.txt
 # Docker
 Dockerfile
 .dockerignore
-
-# Other
-README.md

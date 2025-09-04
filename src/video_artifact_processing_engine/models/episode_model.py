@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import json
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -103,9 +104,9 @@ class Episode:
             'updatedAt': self.updated_at,
             'deletedAt': self.deleted_at,
             'createdAt': self.created_at,
-            'processingInfo': self.processing_info,
+            'processingInfo': json.dumps(self.processing_info),
             'contentType': self.content_type,
-            'additionalData': self.additional_data,
+            'additionalData': json.dumps(self.additional_data),
             'processingDone': self.processing_done,
             'isSynced': self.is_synced
         }

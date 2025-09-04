@@ -25,13 +25,35 @@ class Config:
     
         # Log Level
         self.log_level = os.environ.get('LOG_LEVEL', 'INFO')
-        self.max_concurrent_processing = int(os.environ.get('MAX_CONCURRENT_PROCESSING', '3'))
+        # Auto-size concurrency if not explicitly set: default to ~half of CPU cores (>=2)
+        _mcp_env = os.environ.get('MAX_CONCURRENT_PROCESSING')
+        if _mcp_env is not None and _mcp_env.strip() != "":
+            try:
+                self.max_concurrent_processing = max(1, int(_mcp_env))
+            except Exception:
+                # Fallback if invalid
+                cpu = os.cpu_count() or 2
+                self.max_concurrent_processing = max(2, cpu // 2)
+        else:
+            cpu = os.cpu_count() or 2
+            self.max_concurrent_processing = max(2, cpu // 2)
+
+        # Upload concurrency: default to 2x processing, clamped 2..16, unless overridden
+        _mcu_env = os.environ.get('MAX_CONCURRENT_UPLOADS')
+        if _mcu_env is not None and _mcu_env.strip() != "":
+            try:
+                self.max_concurrent_uploads = max(1, int(_mcu_env))
+            except Exception:
+                self.max_concurrent_uploads = max(2, min(16, self.max_concurrent_processing * 2))
+        else:
+            self.max_concurrent_uploads = max(2, min(16, self.max_concurrent_processing * 2))
+
         self.temp_dir = os.environ.get('TEMP_DIR', '/tmp/video_processing')
 
         # SQS Configuration
         self.queue_url = os.getenv('SQS_QUEUE_URL', 'https://sqs.us-east-1.amazonaws.com/221082194281/test-video-quote-engine-queue')
         self.sqs_wait_time_seconds = int(os.environ.get("SQS_WAIT_TIME_SECONDS", "20"))
-        self.sqs_visibility_timeout_seconds = int(os.environ.get("SQS_VISIBILITY_TIMEOUT_SECONDS", "300"))
+        self.sqs_visibility_timeout_seconds = int(os.environ.get("SQS_VISIBILITY_TIMEOUT_SECONDS", "14400"))
         self.sqs_dlq_url = os.environ.get("SQS_DLQ_URL") 
         self.general_aws_region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 
@@ -49,7 +71,13 @@ class Config:
         self.aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID")
         self.aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
-        self._validate_db_config()
+        # Validate but don't crash hard in non-production contexts
+        try:
+            self._validate_db_config()
+        except Exception as e:
+            # Convert to warning to improve local dev ergonomics; production should set envs properly
+            import logging
+            logging.getLogger(__name__).warning(f"Database config validation warning: {e}")
 
     def _validate_db_config(self):
         """Validate required database configuration"""

@@ -2,8 +2,10 @@
 FROM python:3.11-slim
 
 # Install system dependencies (including ffmpeg) before switching to non-root user
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory in the container
@@ -27,6 +29,9 @@ COPY --chown=appuser:appuser pyproject.toml requirements.txt ./
 
 # Install dependencies using uv (as root before switching users)
 RUN uv pip install --system --no-cache -r requirements.txt
+
+# Ensure /app is owned by appuser before switching users
+RUN chown -R appuser:appuser /app
 
 # Switch to non-root user after installing dependencies
 USER appuser

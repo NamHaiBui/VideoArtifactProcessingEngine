@@ -82,13 +82,37 @@ def sanitize_filename(filename: str) -> str:
     if not filename:
         filename = 'untitled'
     return filename
+
 def create_slug(text: str) -> str:
     """
-    Create a URL-friendly slug from a given text string.
+    Generates a URL-friendly slug from a string, ensuring no double hyphens.
+
+    This function performs the following steps:
+    1. Converts the string to lowercase.
+    2. Replaces any sequence of one or more non-alphanumeric characters 
+       (e.g., spaces, '&', '---') with a single hyphen.
+    3. Removes any leading or trailing hyphens that may result.
+
+    Args:
+        text: The input string to be converted into a slug.
+
+    Returns:
+        A clean, URL-friendly slug string.
     """
-    text = text.strip().lower()
-    text = re.sub(r'\s+', '-', text)
-    text = re.sub(r'[^a-z0-9-]', '', text)
+    # Convert to lowercase
+    text = text.lower()
+    
+    # Replace any character that is not a letter or number with a hyphen.
+    # The `+` quantifier after the character set `[^a-z0-9]` is key.
+    # It matches one or more consecutive non-alphanumeric characters and
+    # replaces the entire sequence with a single hyphen. This is what
+    # prevents the creation of "--" from sequences like " & ".
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    
+    # Remove leading or trailing hyphens that might have been created,
+    # for example, if the original string started or ended with a space.
+    text = text.strip('-')
+    
     return text
     
 def validate_video_file(file_path: Union[str, Path]) -> bool:

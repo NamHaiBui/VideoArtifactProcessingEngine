@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -27,9 +28,8 @@ class Short:
     host: Optional[str] = ''
     host_description: Optional[str] = ''
     is_synced: bool = False
-    is_used_in_summary: bool = False
     transcript_uri: Optional[str] = ''
-    content_type: Optional[str] = "Audio"
+    content_type: Optional[str] = "audio"
     additional_data: Dict[str, Any] = field(default_factory=dict)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -37,6 +37,8 @@ class Short:
     genre_id: Optional[str] = ''
     guest_ids: Optional[List[str]] = field(default_factory=list)
     host_id: Optional[str] = ''
+    chunk_number: Optional[int] = 0
+    is_removed_chunk: bool = False
 
     @classmethod
     def from_db_record(cls, record: Dict[str, Any]) -> 'Short':
@@ -67,7 +69,6 @@ class Short:
             host=record.get("host"),
             host_description=record.get("hostDescription"),
             is_synced=record.get("isSynced", False),
-            is_used_in_summary=record.get("isUsedInSummary", False),
             transcript_uri=record.get("transcriptUri"),
             content_type=record.get("contentType", "Audio"),
             additional_data=additional_data,
@@ -76,7 +77,9 @@ class Short:
             deleted_at=record.get("deletedAt"),
             genre_id=record.get("genreId"),
             guest_ids=record.get("guestIds"),
-            host_id=record.get("hostId")
+            host_id=record.get("hostId"),
+            chunk_number=record.get("chunkNumber"),
+            is_removed_chunk=record.get("isRemovedChunk", False)
         )
 
     def to_db_dict(self) -> Dict[str, Any]:
@@ -104,14 +107,15 @@ class Short:
             "host": self.host,
             "hostDescription": self.host_description,
             "isSynced": self.is_synced,
-            "isUsedInSummary": self.is_used_in_summary,
             "transcriptUri": self.transcript_uri,
             "contentType": self.content_type,
-            "additionalData": self.additional_data,
+            "additionalData": json.dumps(self.additional_data) if self.additional_data is not None else None,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "deletedAt": self.deleted_at,
             "genreId": self.genre_id,
             "guestIds": self.guest_ids,
-            "hostId": self.host_id
+            "hostId": self.host_id,
+            "chunkNumber": self.chunk_number,
+            "isRemovedChunk": self.is_removed_chunk
         }

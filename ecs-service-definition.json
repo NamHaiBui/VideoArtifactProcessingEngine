@@ -1,0 +1,60 @@
+{
+  "serviceName": "video-artifact-processing-service",
+  "cluster": "video-processing-cluster",
+  "taskDefinition": "video-artifact-processing-engine",
+  "desiredCount": 2,
+  "launchType": "FARGATE",
+  "platformVersion": "LATEST",
+  "networkConfiguration": {
+    "awsvpcConfiguration": {
+      "subnets": [
+        "${PRIVATE_SUBNET_1}",
+        "${PRIVATE_SUBNET_2}"
+      ],
+      "securityGroups": [
+        "${SECURITY_GROUP_ID}"
+      ],
+      "assignPublicIp": "DISABLED"
+    }
+  },
+  "loadBalancers": [],
+  "serviceRegistries": [],
+  "deploymentConfiguration": {
+    "deploymentCircuitBreaker": {
+      "enable": true,
+      "rollback": true
+    },
+    "maximumPercent": 200,
+    "minimumHealthyPercent": 50,
+    "alarms": {
+      "alarmNames": [],
+      "enable": false,
+      "rollback": false
+    }
+  },
+  "capacityProviderStrategy": [],
+  "enableExecuteCommand": true,
+  "enableECSManagedTags": true,
+  "propagateTags": "SERVICE",
+  "tags": [
+    {
+      "key": "Environment",
+      "value": "production"
+    },
+    {
+      "key": "Service",
+      "value": "video-artifact-processing"
+    },
+    {
+      "key": "TaskProtection",
+      "value": "enabled"
+    }
+  ],
+  "placementConstraints": [],
+  "placementStrategy": [
+    {
+      "type": "spread",
+      "field": "attribute:ecs.availability-zone"
+    }
+  ]
+}
