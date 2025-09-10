@@ -22,7 +22,6 @@ class Quote:
     genre: Optional[str] = ''
     guests_name: Optional[str] = ''
     guests_description: Optional[str] = ''
-    quote_length: Optional[int] = 0
     quote_rank: Optional[int] = 0
     published_date: Optional[datetime] = None
     quote_audio_url: Optional[str] = ''
@@ -59,7 +58,6 @@ class Quote:
             genre=row.get('genre'),
             guests_name=row.get('guestsName'),
             guests_description=row.get('guestsDescription'),
-            quote_length=row.get('quoteLength'),
             quote_rank=row.get('quoteRank'),
             published_date=row.get('publishedDate'),
             quote_audio_url=row.get('quoteAudioUrl'),
@@ -93,7 +91,6 @@ class Quote:
             'genre': self.genre,
             'guestsName': self.guests_name,
             'guestsDescription': self.guests_description,
-            'quoteLength': self.quote_length,
             'quoteRank': self.quote_rank,
             'publishedDate': self.published_date,
             'quoteAudioUrl': self.quote_audio_url,

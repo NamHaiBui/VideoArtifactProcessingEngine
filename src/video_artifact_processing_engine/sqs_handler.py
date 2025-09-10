@@ -6,12 +6,18 @@ import json
 import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+import asyncio
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
 from video_artifact_processing_engine.config import Config
 from video_artifact_processing_engine.utils.logging_config import setup_custom_logger
+from video_artifact_processing_engine.aws.db_operations import (
+    get_episode_processing_status,
+    get_quotes_and_shorts_by_episode_id,
+    update_episode_processing_flags,
+)
 
 logger = setup_custom_logger(__name__)
 
@@ -154,6 +160,7 @@ class SQSPoller:
                 QueueUrl=self.queue_url,
                 MaxNumberOfMessages=max_messages,
                 WaitTimeSeconds=self.config.sqs_wait_time_seconds,
+                VisibilityTimeout=self.config.sqs_visibility_timeout_seconds,
             )
             
             messages = response.get('Messages', [])
@@ -299,10 +306,29 @@ class SQSPoller:
                 
                 try:
                     logger.info(f"Processing message: {parsed_message.id}")
-                    success = await message_handler(parsed_message)
+
+                    # Start heartbeat to extend visibility while the handler runs
+                    hb_task = asyncio.create_task(self._visibility_heartbeat(receipt_handle))
+                    try:
+                        success = await message_handler(parsed_message)
+                    finally:
+                        # Stop heartbeat as soon as handler finishes
+                        hb_task.cancel()
+                        try:
+                            await hb_task
+                        except asyncio.CancelledError:
+                            pass
                     
                     if success == 'Success':
                         logger.info(f"Successfully processed message: {parsed_message.id}")
+                        # Ensure flags are set if all corresponding items are already processed
+                        flags_ok = await self._ensure_flags_after_success(parsed_message.id)
+                        if not flags_ok:
+                            logger.warning(f"Flags not set after success for {parsed_message.id}; requeuing message to retry flag update.")
+                            # Requeue to retry flag update later; delete current message
+                            self.delete_message(receipt_handle)
+                            self.requeue_message(message_body)
+                            continue
                         self.delete_message(receipt_handle)
                         # Reset NotReady counter on success
                         self._reset_not_ready(parsed_message.id)
@@ -324,6 +350,129 @@ class SQSPoller:
                 
                 except Exception as e:
                     logger.error(f"Error processing message {parsed_message.id}: {e}")
+
+    def _is_valid_chunk(self, c) -> bool:
+        try:
+            if getattr(c, 'is_removed_chunk', False):
+                return False
+            start_ms = getattr(c, 'start_ms', None)
+            end_ms = getattr(c, 'end_ms', None)
+            if start_ms is not None and end_ms is not None:
+                dur = (float(end_ms) - float(start_ms)) / 1000.0
+            else:
+                dur = float(getattr(c, 'chunk_length', 0) or 0)
+            return dur >= 1.0
+        except Exception:
+            return False
+
+    def _is_quote_processed(self, q) -> bool:
+        try:
+            return bool(getattr(q, 'quote_audio_url', None)) and str(getattr(q, 'content_type', '')).lower() == 'video'
+        except Exception:
+            return False
+
+    def _is_chunk_processed(self, c) -> bool:
+        try:
+            return self._is_valid_chunk(c) and bool(getattr(c, 'chunk_audio_url', None)) and str(getattr(c, 'content_type', '')).lower() == 'video'
+        except Exception:
+            return False
+
+    def _is_valid_quote(self, q) -> bool:
+        try:
+            if not getattr(q, 'quote', None) or not getattr(q, 'context', None):
+                return False
+            qlen = getattr(q, 'quote_length', None)
+            if qlen is not None:
+                dur = float(qlen or 0)
+            else:
+                start_ms = getattr(q, 'quote_start_ms', None)
+                end_ms = getattr(q, 'quote_end_ms', None)
+                if start_ms is not None and end_ms is not None:
+                    dur = (float(end_ms) - float(start_ms)) / 1000.0
+                else:
+                    dur = 0.0
+            return dur >= 1.0
+        except Exception:
+            return False
+
+    async def _ensure_flags_after_success(self, episode_id: str) -> bool:
+        """
+        If all quotes/chunks are already processed in DB but flags are not updated,
+        atomically set the flags before we delete the SQS message.
+        Returns True if flags are already correct or successfully set; False otherwise.
+        """
+        try:
+            pi = get_episode_processing_status(episode_id) or {}
+            if bool(pi.get('videoQuotingDone')) and bool(pi.get('videoChunkingDone')):
+                return True
+
+            items = get_quotes_and_shorts_by_episode_id(episode_id)
+            quotes = items.get('quotes', [])
+            shorts = items.get('shorts', [])
+            # Compute completion state per category
+            # Only consider relevant items
+            rel_quotes = [q for q in quotes if self._is_valid_quote(q)]
+            rel_shorts = [s for s in shorts if self._is_valid_chunk(s)]
+            all_quotes_done = all(self._is_quote_processed(q) for q in rel_quotes) if rel_quotes else True
+            all_shorts_done = all(self._is_chunk_processed(s) for s in rel_shorts) if rel_shorts else True
+
+            want_q = all_quotes_done and not bool(pi.get('videoQuotingDone'))
+            want_c = all_shorts_done and not bool(pi.get('videoChunkingDone'))
+            if not (want_q or want_c):
+                return True
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    res = update_episode_processing_flags(
+                        episode_id,
+                        video_quoting_done=True if want_q else None,
+                        video_chunking_done=True if want_c else None,
+                    )
+                    # Re-read to verify
+                    latest = get_episode_processing_status(episode_id) or {}
+                    ok_q = (not want_q) or bool(latest.get('videoQuotingDone'))
+                    ok_c = (not want_c) or bool(latest.get('videoChunkingDone'))
+                    if res and ok_q and ok_c:
+                        return True
+                except Exception as e:
+                    logger.warning(f"Flag set attempt {attempt+1} failed for episode {episode_id}: {e}")
+                # small backoff
+                await asyncio.sleep(0.5)
+            return False
+        except Exception as e:
+            logger.error(f"_ensure_flags_after_success error for {episode_id}: {e}")
+            return False
+
+    async def _visibility_heartbeat(self, receipt_handle: str):
+        """Periodically extend SQS message visibility timeout while work is in progress."""
+        # Choose a conservative heartbeat interval: 1/3 of timeout, capped to 5 minutes minimum spacing
+        timeout = max(30, int(self.config.sqs_visibility_timeout_seconds))
+        interval = max(60, min(300, timeout // 3))
+        try:
+            while True:
+                try:
+                    # Extend visibility to full timeout window again
+                    self.sqs.change_message_visibility(
+                        QueueUrl=self.queue_url,
+                        ReceiptHandle=receipt_handle,
+                        VisibilityTimeout=timeout,
+                    )
+                    logger.debug("Extended message visibility timeout via heartbeat")
+                except Exception as e:
+                    logger.warning(f"Failed to extend message visibility: {e}")
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            # Best-effort final extension to give cleanup time (optional)
+            try:
+                self.sqs.change_message_visibility(
+                    QueueUrl=self.queue_url,
+                    ReceiptHandle=receipt_handle,
+                    VisibilityTimeout=max(60, min(300, int(self.config.sqs_visibility_timeout_seconds))),
+                )
+            except Exception:
+                pass
+            raise
     
     def stop_polling(self):
         """Stop the polling loop."""

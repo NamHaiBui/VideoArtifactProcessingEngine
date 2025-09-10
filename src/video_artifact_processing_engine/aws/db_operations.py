@@ -361,47 +361,27 @@ def get_quotes_by_episode_id(episodeId: str) -> List[Quote]:
         )
         return [Quote.from_db_row(dict(row)) for row in cursor.fetchall()]
 
-async def update_quote_video_url(quoteId: str, quoteAudioUrl: str) -> bool:
-    """Update the video URL for a quote with retry and validation using RETURNING"""
-    def _txn(conn):
-        with conn.cursor() as cursor:
-            if not _try_acquire_advisory_xact_lock_nowait(cursor, 'Quotes', quoteId):
-                logger.info(f"Skipping update_quote_video_url for {quoteId}: lock not available (nowait)")
-                return False
-            now_ts = datetime.utcnow()
-            cursor.execute(
-                '''
-                UPDATE "Quotes"
-                SET "quoteAudioUrl" = %s,
-                    "contentType" = 'video',
-                    "updatedAt" = %s
-                WHERE "quoteId" = %s AND "deletedAt" IS NULL
-                RETURNING "quoteAudioUrl", "updatedAt"
-                ''',
-                (quoteAudioUrl, now_ts, quoteId)
-            )
-            row = cursor.fetchone()
-            if not row:
-                raise psycopg2.OperationalError("No rows updated for quote video URL")
-            rec = dict(row)
-            if rec.get('quoteAudioUrl') != quoteAudioUrl:
-                raise psycopg2.OperationalError("Validation failed: quoteAudioUrl mismatch after update")
-            return True
-    return run_transaction_with_retry(_txn, on_retry_log='Update quote video URL')
 
 async def update_quote_additional_data(
     quoteId: str,
     additional_data: Dict[str, Any],
     content_type: Optional[str] = None,
+    max_lock_retries: int = 5,
+    lock_retry_delay: float = 0.15,
 ) -> bool:
-    """Update only additionalData (and optionally contentType) for a quote."""
+    """Update only additionalData (and optionally contentType) for a quote.
+    Adds lightweight retry for advisory lock acquisition (nowait) so we don't silently skip updates.
+    """
     def _txn(conn):
         with conn.cursor() as cursor:
-            if not _try_acquire_advisory_xact_lock_nowait(cursor, 'Quotes', quoteId):
-                logger.info(f"Skipping update_quote_additional_data for {quoteId}: lock not available (nowait)")
-                return False
+            for attempt in range(max_lock_retries):
+                if _try_acquire_advisory_xact_lock_nowait(cursor, 'Quotes', quoteId):
+                    break
+                if attempt == max_lock_retries - 1:
+                    logger.warning(f"update_quote_additional_data lock not acquired after {max_lock_retries} attempts for {quoteId}")
+                    return False
+                time.sleep(lock_retry_delay)
             now_ts = datetime.utcnow()
-            # Build dynamic pieces
             set_fragments = ['"additionalData" = %s::jsonb', '"updatedAt" = %s']
             params: List[Any] = [json.dumps(additional_data or {}), now_ts]
             if content_type is not None:
@@ -419,7 +399,6 @@ async def update_quote_additional_data(
             if not row:
                 raise psycopg2.OperationalError("No rows updated when setting quote additionalData")
             return True
-    import json
     return run_transaction_with_retry(_txn, on_retry_log='Update quote additional data')
 
 # Shorts / Chunks Operations
@@ -592,8 +571,8 @@ def get_quotes_and_shorts_by_episode_id(episodeId: str) -> Dict[str, List[Any]]:
             results['shorts'] = [Short.from_db_record(dict(row)) for row in shorts_rows]
     return results
 
-async def update_short_video_url(chunkId: str, chunkAudioUrl: str) -> bool:
-    """Update the video URL for a short with retry and validation using RETURNING"""
+async def update_short_video_url(chunkId: str, _unused: str) -> bool:
+    """Preserve original audio URL; only set contentType to 'video' if not already."""
     def _txn(conn):
         with conn.cursor() as cursor:
             if not _try_acquire_advisory_xact_lock_nowait(cursor, 'Shorts', chunkId):
@@ -603,22 +582,16 @@ async def update_short_video_url(chunkId: str, chunkAudioUrl: str) -> bool:
             cursor.execute(
                 '''
                 UPDATE "Shorts"
-                SET "chunkAudioUrl" = %s,
-                    "contentType" = 'video',
+                SET "contentType" = 'video',
                     "updatedAt" = %s
-                WHERE "chunkId" = %s AND "deletedAt" IS NULL
-                RETURNING "chunkAudioUrl", "updatedAt"
+                WHERE "chunkId" = %s AND "deletedAt" IS NULL AND ("contentType" IS NULL OR LOWER("contentType") <> 'video')
+                RETURNING "updatedAt"
                 ''',
-                (chunkAudioUrl, now_ts, chunkId)
+                (now_ts, chunkId)
             )
-            row = cursor.fetchone()
-            if not row:
-                raise psycopg2.OperationalError("No rows updated for short video URL")
-            rec = dict(row)
-            if rec.get('chunkAudioUrl') != chunkAudioUrl:
-                raise psycopg2.OperationalError("Validation failed: chunkAudioUrl mismatch after update")
+            # success even if nothing changed (already video)
             return True
-    return run_transaction_with_retry(_txn, on_retry_log='Update short video URL')
+    return run_transaction_with_retry(_txn, on_retry_log='Update short video (contentType only)')
 
 async def update_short_additional_data(
     chunkId: str,
@@ -780,6 +753,30 @@ def update_episode_processing_flags(
             cursor.execute(sql, params)
             row = cursor.fetchone()
             if not row:
+                # Extra diagnostics to understand why the UPDATE matched zero rows
+                try:
+                    cursor.execute(
+                        'SELECT "episodeId", "deletedAt", "processingInfo" FROM "Episodes" WHERE "episodeId" = %s',
+                        (episode_id,)
+                    )
+                    exists_row = cursor.fetchone()
+                    if exists_row:
+                        logger.error(
+                            "update_episode_processing_flags: Episode %s exists but UPDATE matched 0 rows (deletedAt=%s). Params: quoting_done=%s chunking_done=%s",
+                            episode_id,
+                            dict(exists_row).get('deletedAt'),
+                            video_quoting_done,
+                            video_chunking_done
+                        )
+                    else:
+                        logger.error(
+                            "update_episode_processing_flags: Episode %s not found when attempting to set flags. Params: video_quoting_done=%s video_chunking_chunking_done=%s",
+                            episode_id,
+                            video_quoting_done,
+                            video_chunking_done
+                        )
+                except Exception as diag_e:
+                    logger.error(f"update_episode_processing_flags: diagnostic select failed for {episode_id}: {diag_e}")
                 raise psycopg2.OperationalError("No rows updated when setting processing flags")
 
             # Verify flags in returned JSON if they were requested

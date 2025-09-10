@@ -6,7 +6,7 @@ from botocore.exceptions import ClientError
 import ffmpeg
 import logging
 
-from video_artifact_processing_engine.aws.db_operations import update_quote_video_url, update_quote_additional_data
+from video_artifact_processing_engine.aws.db_operations import update_quote_additional_data
 from video_artifact_processing_engine.utils.ffmpeg_utils import run_ffmpeg_with_retries
 from video_artifact_processing_engine.utils.async_retry import retry_with_backoff, emit_db_retry_failed_metric
 from ..aws.aws_client import create_aws_client_with_retries
@@ -104,7 +104,7 @@ async def process_video_quotes_with_path(
                 return
 
             duration = end_time - start_time
-            if duration < 0.1:
+            if duration < 0:
                 return
 
             quote_filename = f"quote_{quote.quote_id}.mp4"
@@ -139,14 +139,6 @@ async def process_video_quotes_with_path(
                 s3_client.upload_file(quote_path, config.video_quote_bucket, s3_quote_key, ExtraArgs={'ContentType': 'video/mp4'})
                 logging.info(f"Uploaded quote video file to S3 at {s3_quote_key}")
                 video_url = f"https://{config.video_quote_bucket}.s3.us-east-1.amazonaws.com/{s3_quote_key}"
-
-                # Prefer HLS master playlist as the main URL
-                await retry_with_backoff(
-                    update_quote_video_url,
-                    quote.quote_id,
-                    hls_url,
-                    on_final_failure=lambda: emit_db_retry_failed_metric(cloudwatch_client, 'Quote', str(quote.quote_id)),
-                )
                 logging.info(f"Attempted to update quote {quote.quote_id} in DB with new video URL (HLS master)")
 
                 # Update additional data with both paths

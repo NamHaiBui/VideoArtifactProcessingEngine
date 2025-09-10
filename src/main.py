@@ -313,76 +313,83 @@ logging.info(f"Region: {credential_status.get('region')}")
 logging.info(f"Credential sources: {credential_status.get('sources')}")
 
 def validate_db_updates(episode_id, quotes, chunks, video_quote_paths, video_chunk_paths, marker, logger):
-    """
-    Independent validation: re-fetch Postgres state to ensure each processed item is updated
-    with expected data before flipping processingInfo flags to true.
+    """Independent validation using a fresh snapshot.
+
+    We now validate against additionalData (authoritative video metadata store) instead of legacy
+    audio URL columns. For each processed quote/chunk we require:
+      - contentType == 'video'
+      - additionalData.videoMasterPlaylistPath present & non-empty
+      - additionalData.videoMasterPlaylistPath matches the expected HLS URL we just produced
+      - (Optional informational) presence of videoQuotePath / videoChunkPath (not required to pass)
 
     Returns: (quotes_ok: bool, chunks_ok: bool)
     """
     quotes_ok, chunks_ok = True, True
 
-    # Build quick lookup for expected URLs if provided in processing results
-    expected_quote_urls = {}
+    # Build lookup of expected HLS master playlist URLs from processing results
+    expected_quote_hls = {}
     for item in (video_quote_paths or []):
         qid = item.get('quote_id') or item.get('id') or item.get('quoteId')
         url = item.get('hls_url') or item.get('url')
         if qid and url:
-            expected_quote_urls[qid] = url
-    expected_chunk_urls = {}
+            expected_quote_hls[qid] = url
+    expected_chunk_hls = {}
     for item in (video_chunk_paths or []):
         cid = item.get('chunk_id') or item.get('id') or item.get('chunkId')
         url = item.get('hls_url') or item.get('url')
         if cid and url:
-            expected_chunk_urls[cid] = url
+            expected_chunk_hls[cid] = url
 
-    # Get a consistent snapshot of quotes and shorts
     try:
         snapshot = get_quotes_and_shorts_by_episode_id(episode_id)
     except Exception as ve:
         logger.error(f"Error fetching consistent snapshot for validation: {ve}")
         return False, False
 
-    # Validate quotes
+    # QUOTES VALIDATION (all quotes passed in are considered expected, no validity gating)
     if quotes:
         try:
             latest_quotes = snapshot.get('quotes', [])
             latest_map = {q.quote_id: q for q in latest_quotes}
             expected_ids = {q.quote_id for q in quotes}
-            # Count sanity check
             if len(video_quote_paths) != len(expected_ids):
                 quotes_ok = False
                 logger.warning(
-                    f"Quote output count mismatch vs expected IDs: outputs={len(video_quote_paths)}, expected={len(expected_ids)}"
+                    f"Quote output count mismatch: outputs={len(video_quote_paths)} expected={len(expected_ids)}"
                 )
             missing_or_invalid = []
             for qid in expected_ids:
                 q = latest_map.get(qid)
                 stale = False
-                if q and marker is not None and q.updated_at is not None:
+                if q and marker and q.updated_at:
                     try:
                         stale = q.updated_at < marker
                     except Exception:
                         stale = False
-                url_match = True
-                if q and expected_quote_urls:
-                    expected_url = expected_quote_urls.get(qid)
-                    if expected_url:
-                        url_match = (q.quote_audio_url == expected_url)
+                # Extract additionalData safely
+                ad = getattr(q, 'additional_data', {}) if q else {}
+                if not isinstance(ad, dict):
+                    ad = {}
+                master = ad.get('videoMasterPlaylistPath') if ad else None
+                expected_hls = expected_quote_hls.get(qid)
+                master_match = (master == expected_hls) if expected_hls else bool(master)
                 if (not q
-                    or not q.quote_audio_url
-                    or not url_match
-                    or str(q.content_type).lower() != 'video'
+                    or str(getattr(q, 'content_type', '')).lower() != 'video'
+                    or not master
+                    or not master_match
                     or q.updated_at is None
                     or stale):
                     missing_or_invalid.append(qid)
             if missing_or_invalid:
                 quotes_ok = False
-                logger.warning(f"Quote validation failed for {len(missing_or_invalid)} items: {missing_or_invalid[:5]}{'...' if len(missing_or_invalid) > 5 else ''}")
+                logger.warning(
+                    f"Quote additionalData validation failed for {len(missing_or_invalid)} items: {missing_or_invalid[:5]}{'...' if len(missing_or_invalid)>5 else ''}"
+                )
         except Exception as ve:
             quotes_ok = False
-            logger.error(f"Error validating quotes in DB: {ve}")
+            logger.error(f"Error validating quotes additionalData: {ve}")
 
-    # Validate chunks (shorts)
+    # CHUNKS VALIDATION
     if chunks:
         try:
             latest_chunks = snapshot.get('shorts', [])
@@ -391,37 +398,86 @@ def validate_db_updates(episode_id, quotes, chunks, video_quote_paths, video_chu
             if len(video_chunk_paths) != len(expected_cids):
                 chunks_ok = False
                 logger.warning(
-                    f"Chunk output count mismatch vs expected IDs: outputs={len(video_chunk_paths)}, expected={len(expected_cids)}"
+                    f"Chunk output count mismatch: outputs={len(video_chunk_paths)} expected={len(expected_cids)}"
                 )
             missing_or_invalid_c = []
             for cid in expected_cids:
                 c = latest_map_c.get(cid)
                 stale_c = False
-                if c and marker is not None and c.updated_at is not None:
+                if c and marker and c.updated_at:
                     try:
                         stale_c = c.updated_at < marker
                     except Exception:
                         stale_c = False
-                url_match_c = True
-                if c and expected_chunk_urls:
-                    expected_url_c = expected_chunk_urls.get(cid)
-                    if expected_url_c:
-                        url_match_c = (c.chunk_audio_url == expected_url_c)
+                ad = getattr(c, 'additional_data', {}) if c else {}
+                if not isinstance(ad, dict):
+                    ad = {}
+                master = ad.get('videoMasterPlaylistPath') if ad else None
+                expected_hls = expected_chunk_hls.get(cid)
+                master_match = (master == expected_hls) if expected_hls else bool(master)
                 if (not c
-                    or not c.chunk_audio_url
-                    or not url_match_c
-                    or str(c.content_type).lower() != 'video'
+                    or str(getattr(c, 'content_type', '')).lower() != 'video'
+                    or not master
+                    or not master_match
                     or c.updated_at is None
                     or stale_c):
                     missing_or_invalid_c.append(cid)
             if missing_or_invalid_c:
                 chunks_ok = False
-                logger.warning(f"Chunk validation failed for {len(missing_or_invalid_c)} items: {missing_or_invalid_c[:5]}{'...' if len(missing_or_invalid_c) > 5 else ''}")
+                logger.warning(
+                    f"Chunk additionalData validation failed for {len(missing_or_invalid_c)} items: {missing_or_invalid_c[:5]}{'...' if len(missing_or_invalid_c)>5 else ''}"
+                )
         except Exception as ve:
             chunks_ok = False
-            logger.error(f"Error validating chunks in DB: {ve}")
+            logger.error(f"Error validating chunks additionalData: {ve}")
 
     return quotes_ok, chunks_ok
+def _is_valid_chunk(ch) -> bool:
+    try:
+        if getattr(ch, 'is_removed_chunk', False):
+            return False
+        start_ms = getattr(ch, 'start_ms', None)
+        end_ms = getattr(ch, 'end_ms', None)
+        if start_ms is not None and end_ms is not None:
+            dur = (float(end_ms) - float(start_ms)) / 1000.0
+        else:
+            dur = float(getattr(ch, 'chunk_length', 0) or 0)
+        return dur >= 1.0
+    except Exception:
+        return False
+
+def _has_master_playlist(obj) -> bool:
+    try:
+        data = getattr(obj, 'additional_data', None)
+        if not isinstance(data, dict):
+            return False
+        val = data.get('videoMasterPlaylistPath')
+        return isinstance(val, str) and len(val.strip()) > 0
+    except Exception:
+        return False
+
+def _is_quote_processed(q) -> bool:
+    """Quote processed only when content_type=video AND additionalData has a non-empty videoMasterPlaylistPath."""
+    try:
+        return str(getattr(q, 'content_type', '')).lower() == 'video' and _has_master_playlist(q)
+    except Exception:
+        return False
+
+def _is_chunk_processed(c) -> bool:
+    """Chunk processed only when valid length, content_type=video AND additionalData has a non-empty videoMasterPlaylistPath."""
+    try:
+        return _is_valid_chunk(c) and str(getattr(c, 'content_type', '')).lower() == 'video' and _has_master_playlist(c)
+    except Exception:
+        return False
+
+def _all_quotes_processed(quotes_list) -> bool:
+    # All quotes are now considered relevant (removed duration gating per directive)
+    relevant = list(quotes_list or [])
+    return all(_is_quote_processed(q) for q in relevant) if relevant else True
+
+def _all_chunks_processed(chunks_list) -> bool:
+    relevant = [c for c in (chunks_list or []) if _is_valid_chunk(c)]
+    return all(_is_chunk_processed(c) for c in relevant) if relevant else True
 
 async def process_video_message(message: VideoProcessingMessage) -> str:
     """
@@ -506,7 +562,7 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         
         episode_title = episode_item.episode_title
         s3_http_link = episode_item.additional_data.get("videoLocation")
-        logger.info(f"Episode title: {episode_item.additional_data}")
+        logger.info(f"Episode title: {episode_item.episode_title}")
         podcast_title = str(episode_item.channel_name)
         if not s3_http_link:
             logger.error(f"No videoLocation found for episode {episode_id}")
@@ -534,20 +590,22 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
             session.processing_status = 'failed'
             return 'Failed'
         quotes = []
-        if processing_info.get("quotingDone",None) and not processing_info.get("videoQuotingDone", False):
+        all_quotes = []
+        if processing_info.get("quotingDone", None) and not processing_info.get("videoQuotingDone", False):
             # Retrieve quotes for processing
             all_quotes = get_quotes_by_episode_id(episode_id)
-            quotes = [x for x in all_quotes if x.quote and x.quote.strip() and x.context and x.context.strip()]
+            quotes = [x for x in all_quotes]
 
             # Log quote information for debugging
             if all_quotes:
-                quote_lengths = [x.quote_length or 0 for x in all_quotes]
+                quote_lengths = [(x.context_end_ms - x.context_start_ms) if x.context_start_ms is not None and x.context_end_ms is not None else 0 for x in all_quotes]
                 logger.info(f"Quote lengths: min={min(quote_lengths)}, max={max(quote_lengths)}, avg={sum(quote_lengths)/len(quote_lengths):.2f}")
                 zero_length_count = sum(1 for x in quote_lengths if x == 0.0)
                 logger.info(f"Quotes with 0.0 length: {zero_length_count}/{len(all_quotes)}")
 
         chunks = []
-        if  processing_info.get("chunkingDone",None) and not processing_info.get("videoChunkingDone", False):
+        all_chunks = []
+        if processing_info.get("chunkingDone", None) and not processing_info.get("videoChunkingDone", False):
             # Retrieve chunks for processing
             all_chunks = get_shorts_by_episode_id(episode_id)
             chunks = [x for x in all_chunks if x.transcript and x.transcript.strip()]
@@ -557,31 +615,80 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                 logger.info(f"Chunk lengths: min={min(chunk_lengths)}, max={max(chunk_lengths)}, avg={sum(chunk_lengths)/len(chunk_lengths):.2f}")
                 zero_length_count = sum(1 for x in chunk_lengths if x == 0.0)
                 logger.info(f"Chunks with 0.0 length: {zero_length_count}/{len(all_chunks)}")
-        if (processing_info.get("videoChunkingDone", False) and processing_info.get("videoQuotingDone", False)):
+
+        # If both categories already complete, short-circuit
+        if processing_info.get("videoChunkingDone", False) and processing_info.get("videoQuotingDone", False):
             logger.warning("Episodes are already processed")
             return 'Success'
+
+        # Filter already-processed items to achieve idempotent streaming behavior
+        # Process all quotes regardless of duration/validity (user directive)
+        quotes_to_process = [q for q in quotes if not _is_quote_processed(q)]
+        chunks_to_process = [c for c in chunks if _is_valid_chunk(c) and not _is_chunk_processed(c)]
+
         num_quotes = len(quotes)
         num_chunks = len(chunks)
-        if not ((quotes or processing_info.get("videoQuotingDone", False)) and (chunks or processing_info.get("videoChunkingDone", False))):
-            logger.warning("Quotes and chunks are not available at once, requeue message for later processing")
-            return 'NotReady'
-        logger.info(f"Processing episode {episode_id}, ({episode_title}) - {num_quotes} quotes, {num_chunks} chunks")
+        logger.info(f"Processing episode {episode_id}, ({episode_title}) - {num_quotes} quotes ({len(quotes_to_process)} pending), {num_chunks} chunks ({len(chunks_to_process)} pending)")
         logger.info(f"File naming: Podcast='{podcast_title}', Episode='{episode_title}'")
         logger.info(f"Video source: {s3_key}")
         logger.info(f"Chunking status: {processing_info} - proceeding with video processing")
         
-
         logger.info(f"Retrieved {len(quotes)} quotes and {len(chunks)} chunks for episode: {episode_id}")
 
-        # Process Video Artifacts (both quotes and chunks) in unified way
-        if quotes or chunks:
+        # If nothing is pending in either category, finalize flags if DB reflects completion
+        if not quotes_to_process and not chunks_to_process:
+            try:
+                # Confirm all are processed in DB before flipping
+                quotes_all_done = _all_quotes_processed(all_quotes) if all_quotes else True
+                chunks_all_done = _all_chunks_processed(all_chunks) if all_chunks else True
+                if quotes_all_done or chunks_all_done:
+                    want_q = bool(quotes_all_done)
+                    want_c = bool(chunks_all_done)
+                    logger.info("No pending items; ensuring processing flags reflect completion.")
+                    # Ensure episode contentType is video via minimal episode update only if needed
+                    if episode_item.content_type != 'video':
+                        episode_item.content_type = 'video'
+                        try:
+                            update_episode_item(episode_item)
+                        except Exception as ue:
+                            logger.warning(f"Failed minimal episode content_type update: {ue}")
+                    # Atomically set flags with retry + read-back validation
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            res = update_episode_processing_flags(
+                                episode_id,
+                                video_quoting_done=True if want_q else None,
+                                video_chunking_done=True if want_c else None,
+                            )
+                            # Re-read to verify flags persisted
+                            latest_pi = get_episode_processing_status(episode_id) or {}
+                            ok_q = (not want_q) or bool(latest_pi.get('videoQuotingDone'))
+                            ok_c = (not want_c) or bool(latest_pi.get('videoChunkingDone'))
+                            if res and ok_q and ok_c:
+                                break
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Flag update validation failed (attempt {attempt+1}); retrying...")
+                                await asyncio.sleep(0.5)
+                        except Exception as fe:
+                            if attempt == max_retries - 1:
+                                logger.warning(f"Failed to set processing flags atomically after retries: {fe}")
+                            else:
+                                logger.warning(f"Flag update attempt {attempt+1} error: {fe}; retrying...")
+                                await asyncio.sleep(0.5)
+            finally:
+                session.processing_status = 'success'
+            return 'Success'
+
+        # Process Video Artifacts for only pending items (streamed resume behavior)
+        if quotes_to_process or chunks_to_process:
             logging.info(f"Starting unified video artifact processing...")
             
             # Mark session as critical for ECS task protection
             session.set_critical(True)
             
-            should_process_quotes = quotes
-            should_process_chunks = chunks
+            should_process_quotes = len(quotes_to_process) > 0
+            should_process_chunks = len(chunks_to_process) > 0
             
 
             try:
@@ -594,8 +701,8 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                     episode_title=episode_title,
                     s3_video_key=s3_video_key,
                     s3_video_key_prefix=s3_key,
-                    chunks_info=chunks,
-                    quotes_info=quotes,
+                    chunks_info=chunks_to_process,
+                    quotes_info=quotes_to_process,
                     overwrite=True
                 )
                 
@@ -604,77 +711,20 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                 
                 # Log results counts
                 if should_process_quotes:
-                    logging.info(f"Video quote processing completed: {len(video_quote_paths)} quotes")
-                    if len(video_quote_paths) != num_quotes:
-                        logging.warning(f"Quote count mismatch: {len(video_quote_paths)} != {num_quotes}")
+                    logging.info(f"Video quote processing completed (pending only): {len(video_quote_paths)} quotes")
                 if should_process_chunks:
-                    logger.info(f"Video chunking produced: {len(video_chunk_paths)} artifacts")
+                    logger.info(f"Video chunking produced (pending only): {len(video_chunk_paths)} artifacts")
 
                 # Independent validation: ensure DB has updated URLs/content types
-                quotes_ok, chunks_ok = True, True
-                if should_process_quotes:
-                    try:
-                        latest_quotes = get_quotes_by_episode_id(episode_id)
-                        latest_map = {q.quote_id: q for q in latest_quotes}
-                        expected_ids = {q.quote_id for q in quotes}
-                        missing_or_stale = []
-                        for qid in expected_ids:
-                            q = latest_map.get(qid)
-                            # Require our target fields updated and updated_at not older than marker if available
-                            outdated = False
-                            q_updated = getattr(q, 'updated_at', None) if q else None
-                            if q_updated is not None and isinstance(q_updated, datetime) and isinstance(validation_marker, datetime):
-                                outdated = q_updated < validation_marker
-                            if (not q or not q.quote_audio_url or str(q.content_type).lower() != 'video' or outdated):
-                                missing_or_stale.append(qid)
-                        if missing_or_stale:
-                            quotes_ok = False
-                            logger.warning(f"Quote validation failed for {len(missing_or_stale)} items: {missing_or_stale[:5]}{'...' if len(missing_or_stale) > 5 else ''}")
-                    except Exception as ve:
-                        quotes_ok = False
-                        logger.error(f"Error validating quotes in DB: {ve}")
-
-                if should_process_chunks:
-                    try:
-                        def _is_valid_chunk(ch):
-                            try:
-                                if getattr(ch, 'is_removed_chunk', False):
-                                    return False
-                                start_ms = getattr(ch, 'start_ms', None)
-                                end_ms = getattr(ch, 'end_ms', None)
-                                if start_ms is not None and end_ms is not None:
-                                    dur = (float(end_ms) - float(start_ms)) / 1000.0
-                                else:
-                                    dur = float(getattr(ch, 'chunk_length', 0) or 0)
-                                return dur >= 1.0
-                            except Exception:
-                                return False
-
-                        latest_chunks = get_shorts_by_episode_id(episode_id)
-                        latest_map_c = {c.chunk_id: c for c in latest_chunks}
-                        expected_valid_cids = {c.chunk_id for c in chunks if _is_valid_chunk(c)}
-
-                        # Optional: log effective expected vs produced count
-                        if expected_valid_cids and len(video_chunk_paths) != len(expected_valid_cids):
-                            logger.warning(
-                                f"Chunk count mismatch after excluding invalid chunks: produced={len(video_chunk_paths)} expected_valid={len(expected_valid_cids)}"
-                            )
-
-                        missing_or_stale_c = []
-                        for cid in expected_valid_cids:
-                            c = latest_map_c.get(cid)
-                            outdated_c = False
-                            c_updated = getattr(c, 'updated_at', None) if c else None
-                            if c_updated is not None and isinstance(c_updated, datetime) and isinstance(validation_marker, datetime):
-                                outdated_c = c_updated < validation_marker
-                            if (not c or not c.chunk_audio_url or str(c.content_type).lower() != 'video' or outdated_c):
-                                missing_or_stale_c.append(cid)
-                        if missing_or_stale_c:
-                            chunks_ok = False
-                            logger.warning(f"Chunk validation failed for {len(missing_or_stale_c)} items: {missing_or_stale_c[:5]}{'...' if len(missing_or_stale_c) > 5 else ''}")
-                    except Exception as ve:
-                        chunks_ok = False
-                        logger.error(f"Error validating chunks in DB: {ve}")
+                quotes_ok, chunks_ok = validate_db_updates(
+                    episode_id=episode_id,
+                    quotes=quotes_to_process if should_process_quotes else [],
+                    chunks=chunks_to_process if should_process_chunks else [],
+                    video_quote_paths=video_quote_paths,
+                    video_chunk_paths=video_chunk_paths,
+                    marker=validation_marker,
+                    logger=logger,
+                )
 
                 # Decide based on validation results
                 if (should_process_quotes and not quotes_ok) or (should_process_chunks and not chunks_ok):
@@ -686,104 +736,67 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                     await asyncio.sleep(jitter_s)
 
                     # Re-run validations with a fresh read
-                    quotes_ok_retry, chunks_ok_retry = True, True
-                    if should_process_quotes:
-                        try:
-                            latest_quotes = get_quotes_by_episode_id(episode_id)
-                            latest_map = {q.quote_id: q for q in latest_quotes}
-                            expected_ids = {q.quote_id for q in quotes}
-                            missing_or_stale = []
-                            for qid in expected_ids:
-                                q = latest_map.get(qid)
-                                outdated = False
-                                q_updated = getattr(q, 'updated_at', None) if q else None
-                                if q_updated is not None and isinstance(q_updated, datetime) and isinstance(validation_marker, datetime):
-                                    outdated = q_updated < validation_marker
-                                if (not q or not q.quote_audio_url or str(q.content_type).lower() != 'video' or outdated):
-                                    missing_or_stale.append(qid)
-                            if missing_or_stale:
-                                quotes_ok_retry = False
-                                logger.warning(
-                                    f"Quote validation (retry) failed for {len(missing_or_stale)} items: {missing_or_stale[:5]}{'...' if len(missing_or_stale) > 5 else ''}"
-                                )
-                        except Exception as ve:
-                            quotes_ok_retry = False
-                            logger.error(f"Error validating quotes in DB (retry): {ve}")
-
-                    if should_process_chunks:
-                        try:
-                            def _is_valid_chunk(ch):
-                                try:
-                                    if getattr(ch, 'is_removed_chunk', False):
-                                        return False
-                                    start_ms = getattr(ch, 'start_ms', None)
-                                    end_ms = getattr(ch, 'end_ms', None)
-                                    if start_ms is not None and end_ms is not None:
-                                        dur = (float(end_ms) - float(start_ms)) / 1000.0
-                                    else:
-                                        dur = float(getattr(ch, 'chunk_length', 0) or 0)
-                                    return dur >= 1.0
-                                except Exception:
-                                    return False
-
-                            latest_chunks = get_shorts_by_episode_id(episode_id)
-                            latest_map_c = {c.chunk_id: c for c in latest_chunks}
-                            expected_valid_cids = {c.chunk_id for c in chunks if _is_valid_chunk(c)}
-
-                            missing_or_stale_c = []
-                            for cid in expected_valid_cids:
-                                c = latest_map_c.get(cid)
-                                outdated_c = False
-                                c_updated = getattr(c, 'updated_at', None) if c else None
-                                if c_updated is not None and isinstance(c_updated, datetime) and isinstance(validation_marker, datetime):
-                                    outdated_c = c_updated < validation_marker
-                                if (not c or not c.chunk_audio_url or str(c.content_type).lower() != 'video' or outdated_c):
-                                    missing_or_stale_c.append(cid)
-                            if missing_or_stale_c:
-                                chunks_ok_retry = False
-                                logger.warning(
-                                    f"Chunk validation (retry) failed for {len(missing_or_stale_c)} items: {missing_or_stale_c[:5]}{'...' if len(missing_or_stale_c) > 5 else ''}"
-                                )
-                        except Exception as ve:
-                            chunks_ok_retry = False
-                            logger.error(f"Error validating chunks in DB (retry): {ve}")
+                    quotes_ok_retry, chunks_ok_retry = validate_db_updates(
+                        episode_id=episode_id,
+                        quotes=quotes_to_process if should_process_quotes else [],
+                        chunks=chunks_to_process if should_process_chunks else [],
+                        video_quote_paths=video_quote_paths,
+                        video_chunk_paths=video_chunk_paths,
+                        marker=validation_marker,
+                        logger=logger,
+                    )
 
                     if (should_process_quotes and not quotes_ok_retry) or (should_process_chunks and not chunks_ok_retry):
                         logger.warning("Independent validation failed after retry. Will requeue message and skip processingInfo update.")
                         session.set_critical(False)
                         return 'NotReady'
 
-                # Only now update processingInfo flags and persist episode update
-                if episode_item.processing_info is None:
-                    episode_item.processing_info = {}
-                if should_process_quotes:
-                    episode_item.processing_info['videoQuotingDone'] = True
-                if should_process_chunks:
-                    episode_item.processing_info['videoChunkingDone'] = True
-                episode_item.content_type = 'video'
+                # Only now (post-validation) update processingInfo flags for categories that are fully done
+                try:
+                    # Re-read all to determine completion (independent of what we processed this run)
+                    final_quotes = get_quotes_by_episode_id(episode_id) if processing_info.get("quotingDone", None) else []
+                    final_chunks = get_shorts_by_episode_id(episode_id) if processing_info.get("chunkingDone", None) else []
 
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        latest_processing_info = get_episode_processing_status(episode_id)
-                        if not latest_processing_info:
-                            logger.warning(f"No processing info found for episode {episode_id}")
-                            latest_processing_info = {}
-                        for key, value in latest_processing_info.items():
-                            episode_item.processing_info[key] = value
-                        result = update_episode_item(episode_item)
-                        if result:
-                            logger.info(f"Episode item updated successfully on attempt {attempt + 1}")
-                        break
-                    except Exception as update_error:
-                        if attempt == max_retries - 1:
-                            logger.error(f"Failed to update episode item after {max_retries} attempts: {update_error}")
-                            logger.error(f"Update error traceback: {traceback.format_exc()}")
-                            session.set_critical(False)  # Remove protection on failure
-                            return 'Failed'
-                        else:
-                            logger.warning(f"Episode item update attempt {attempt + 1} failed: {update_error}. Retrying...")
-                            await asyncio.sleep(1)  # Wait 1 second before retry
+                    want_q = _all_quotes_processed(final_quotes) if final_quotes or processing_info.get("quotingDone", None) else False
+                    want_c = _all_chunks_processed(final_chunks) if final_chunks or processing_info.get("chunkingDone", None) else False
+
+                    if want_q or want_c:
+                        logger.info(f"Ensuring processing flags set: videoQuotingDone={want_q}, videoChunkingDone={want_c}")
+                        # Ensure episode content type is set to video; update minimally if needed
+                        if episode_item.content_type != 'video':
+                            episode_item.content_type = 'video'
+                            try:
+                                update_episode_item(episode_item)
+                            except Exception as ue:
+                                logger.warning(f"Failed minimal episode content_type update: {ue}")
+                        # Atomically set only the flags that are done, with retries and read-back validation
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                res = update_episode_processing_flags(
+                                    episode_id,
+                                    video_quoting_done=True if want_q else None,
+                                    video_chunking_done=True if want_c else None,
+                                )
+                                latest_pi = get_episode_processing_status(episode_id) or {}
+                                ok_q = (not want_q) or bool(latest_pi.get('videoQuotingDone'))
+                                ok_c = (not want_c) or bool(latest_pi.get('videoChunkingDone'))
+                                if res and ok_q and ok_c:
+                                    break
+                                if attempt < max_retries - 1:
+                                    logger.warning(f"Flag update validation failed (attempt {attempt+1}); retrying...")
+                                    await asyncio.sleep(0.5)
+                            except Exception as upd_e:
+                                if attempt == max_retries - 1:
+                                    logger.error(f"Failed to update processing flags after retries: {upd_e}")
+                                    raise
+                                logger.warning(f"Flag update attempt {attempt+1} error: {upd_e}; retrying...")
+                                await asyncio.sleep(0.5)
+                except Exception as update_error:
+                    logger.error(f"Failed to update processing flags: {update_error}")
+                    logger.error(f"Update error traceback: {traceback.format_exc()}")
+                    session.set_critical(False)
+                    return 'Failed'
                             
             except Exception as e:
                 if should_process_quotes:
@@ -794,25 +807,25 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         else:
             logging.info(f"All video processing already completed, skipping...")
 
-        # Store results in session
-        session.set_result('quotes', quotes)
-        session.set_result('chunks', chunks)
+        # Store results in session (only pending sets were processed)
+        session.set_result('quotes', quotes_to_process)
+        session.set_result('chunks', chunks_to_process)
 
-        logger.debug(f"Processing results - quotes: {len(quotes)}, chunks: {len(chunks)}")
-        
+        logger.debug(f"Processing results - quotes pending processed: {len(quotes_to_process)}, chunks pending processed: {len(chunks_to_process)}")
+
         logger.info(f"Successfully processed video artifacts for {podcast_title}/{episode_title}")
         session.processing_status = 'success'
-        
+
         # Update processing statistics
         processing_stats['total_processed'] += 1
         processing_stats['successful'] += 1
-        
+
         # Log stats every 10 processed messages
         if processing_stats['total_processed'] % 10 == 0:
             log_processing_stats()
-        
+
         return 'Success'
-            
+
     except Exception as e:
         session.set_critical(False)  # Ensure protection is removed on failure
         logger.error(f"Error processing message: {e}")
