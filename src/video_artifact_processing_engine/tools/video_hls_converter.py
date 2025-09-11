@@ -47,17 +47,19 @@ class VideoHLSConverter:
             output_playlist = os.path.join(rendition_dir, f"{r['name']}.m3u8")
             segment_filename = os.path.join(rendition_dir, f"{r['name']}.m4s")
             scaled_v_stream = input_stream.video.filter('scale', r['resolution'])
-            
+
             output = ffmpeg.output(
-                scaled_v_stream, input_stream.audio, output_playlist,
+                scaled_v_stream,
+                input_stream.audio,
+                output_playlist,
                 vcodec='libx264',
                 video_bitrate=r['bitrate'],
-                preset='veryfast',
+                preset=getattr(config, 'ffmpeg_preset', 'veryfast'),
                 acodec='aac',
                 audio_bitrate='96k',
                 **hls_params,
                 **{'x264-params': 'keyint=48:min-keyint=48:scenecut=0'},
-                hls_segment_filename=segment_filename
+                hls_segment_filename=segment_filename,
             )
             output_streams.append(output)
             stream_map_string += f"v:{i},a:{i} "
@@ -74,30 +76,30 @@ class VideoHLSConverter:
         # after verifying rendition playlists exist.
         cmd = ['ffmpeg', '-y'] + args
 
-        try:
-            logger.info(f"Running unified ffmpeg command: {' '.join(cmd)}")
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
+        async def run_hls_once() -> None:
+            try:
+                logger.info(f"Running unified ffmpeg command: {' '.join(cmd)}")
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                if process.returncode != 0:
+                    error_message = stderr.decode() if stderr else "No stderr output."
+                    logger.error(f"Unified FFmpeg HLS transcoding failed with return code {process.returncode}")
+                    logger.error(f"FFmpeg stderr: {error_message}")
+                    raise RuntimeError(f"HLS Transcoding Failed: {error_message}")
+                logger.info("Unified FFmpeg HLS transcoding completed successfully.")
+            except ffmpeg.Error as e:
+                logger.error(f"FFmpeg error during unified HLS command: {e.stderr.decode()}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error running unified HLS command: {e}")
+                raise
 
-            if process.returncode != 0:
-                error_message = stderr.decode() if stderr else "No stderr output."
-                logger.error(f"Unified FFmpeg HLS transcoding failed with return code {process.returncode}")
-                logger.error(f"FFmpeg stderr: {error_message}")
-                raise RuntimeError(f"HLS Transcoding Failed: {error_message}")
-                
-            logger.info("Unified FFmpeg HLS transcoding completed successfully.")
-
-        except ffmpeg.Error as e:
-            logger.error(f"FFmpeg error during unified HLS command: {e.stderr.decode()}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error running unified HLS command: {e}")
-            raise
+        # Run once, validate duration, retry one time if needed
+        await run_hls_once()
 
         # Verification and Master playlist generation for 100% reliability
         # 1) Ensure rendition playlists and segments exist and look correct
@@ -161,6 +163,90 @@ class VideoHLSConverter:
                 raise RuntimeError("Master playlist content invalid.")
         except Exception as e:
             raise RuntimeError(f"Failed to read/validate master playlist: {e}")
+
+        # 4) Master playlist duration validation: sum target segments per variant should roughly match source clip duration
+        # We tolerate a small delta due to GOP alignment and HLS time rounding.
+        try:
+            # Get source clip duration via ffprobe (seconds)
+            probe = await asyncio.create_subprocess_exec(
+                'ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', source_clip_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await probe.communicate()
+            src_dur = float(out.decode().strip() or '0')
+        except Exception as e:
+            logger.warning(f"Failed to probe source duration for {source_clip_path}: {e}")
+            src_dur = 0.0
+
+        # Parse one rendition playlist (highest bitrate) to compute duration by summing EXTINF
+        def parse_playlist_duration(path: str) -> float:
+            total = 0.0
+            try:
+                with open(path, 'r', encoding='utf-8') as pf:
+                    for line in pf:
+                        if line.startswith('#EXTINF:'):
+                            try:
+                                val = line.split(':', 1)[1].split(',')[0]
+                                total += float(val)
+                            except Exception:
+                                pass
+            except Exception:
+                return 0.0
+            return total
+
+        # Pick the top rendition (720p) if present otherwise first one
+        top_variant = next((r for r in renditions if r['name'] == '720p'), renditions[0])
+        top_playlist_path = os.path.join(output_dir, top_variant['name'], f"{top_variant['name']}.m3u8")
+        rend_dur = parse_playlist_duration(top_playlist_path)
+
+        # If either duration is zero, skip validation (avoid false negatives)
+        if src_dur > 0 and rend_dur > 0:
+            delta = abs(src_dur - rend_dur)
+            tolerance = max(2.5, 0.03 * src_dur)  # at least 2.5s or 3%
+            if delta > tolerance:
+                logger.warning(f"HLS duration mismatch (src={src_dur:.2f}s vs hls={rend_dur:.2f}s, delta={delta:.2f}s > tol={tolerance:.2f}s). Re-processing once.")
+                # Clean output_dir and redo once
+                try:
+                    shutil.rmtree(output_dir, ignore_errors=True)
+                    os.makedirs(output_dir, exist_ok=True)
+                except Exception:
+                    pass
+                await run_hls_once()
+                # Rebuild/validate playlists again quickly
+                for r in renditions:
+                    rendition_dir = os.path.join(output_dir, r['name'])
+                    playlist_path = os.path.join(rendition_dir, f"{r['name']}.m3u8")
+                    if not os.path.exists(playlist_path):
+                        raise RuntimeError("Re-processing failed to produce rendition playlists.")
+                # Re-generate master playlist after reprocess
+                master_lines = [
+                    '#EXTM3U',
+                    '#EXT-X-VERSION:7',
+                ]
+                for r in renditions:
+                    # reuse logic for bitrate estimation
+                    def bitrate_to_int(bitrate: str) -> int:
+                        try:
+                            if bitrate.endswith('k'):
+                                return int(float(bitrate[:-1]) * 1000)
+                            if bitrate.endswith('M'):
+                                return int(float(bitrate[:-1]) * 1_000_000)
+                            return int(bitrate)
+                        except Exception:
+                            return 800000
+                    bw = bitrate_to_int(r['bitrate'])
+                    res = r['resolution']
+                    playlist_rel = f"{r['name']}/{r['name']}.m3u8"
+                    master_lines.append(f"#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={res},CODECS=\"avc1.4d401f,mp4a.40.2\"")
+                    master_lines.append(playlist_rel)
+                with open(master_playlist_path, 'w', encoding='utf-8') as mf:
+                    mf.write('\n'.join(master_lines) + '\n')
+                # Recheck duration once more (best effort)
+                rend_dur = parse_playlist_duration(top_playlist_path)
+                delta = abs(src_dur - rend_dur)
+                if src_dur > 0 and rend_dur > 0 and delta > tolerance:
+                    raise RuntimeError(f"HLS duration still mismatched after reprocess (delta={delta:.2f}s > tol={tolerance:.2f}s)")
 
         return master_playlist_path
 

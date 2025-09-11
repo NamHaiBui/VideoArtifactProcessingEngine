@@ -115,7 +115,14 @@ async def process_video_quotes_with_path(
                 # Build and run the ffmpeg command with retries
                 ffmpeg_output = (
                     ffmpeg.input(full_video_path, ss=start_time, t=duration)
-                    .output(quote_path, vcodec='libx264', acodec='aac', crf=23, preset='medium', movflags='+faststart')
+                    .output(
+                        quote_path,
+                        vcodec='libx264',
+                        acodec='aac',
+                        crf=23,
+                        preset=getattr(config, 'ffmpeg_preset', 'medium'),
+                        movflags='+faststart',
+                    )
                     .overwrite_output()
                 )
                 success, _stderr = await run_ffmpeg_with_retries(ffmpeg_output, f"for quote {quote.quote_id}")

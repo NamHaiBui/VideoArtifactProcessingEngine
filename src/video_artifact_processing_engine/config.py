@@ -50,6 +50,15 @@ class Config:
 
         self.temp_dir = os.environ.get('TEMP_DIR', '/tmp/video_processing')
 
+        # Runtime environment detection (ECS/Fargate awareness)
+        exec_env = os.environ.get('AWS_EXECUTION_ENV', '')
+        self.is_fargate = 'FARGATE' in exec_env or bool(os.environ.get('ECS_CONTAINER_METADATA_URI_V4'))
+
+    # FFmpeg tuning for Fargate: allow env override for preset with safe defaults
+    # Default preset: veryfast on Fargate (CPU-efficient), medium elsewhere unless overridden
+        default_preset = 'veryfast' if self.is_fargate else 'medium'
+        self.ffmpeg_preset = os.environ.get('FFMPEG_PRESET', default_preset)
+
         # SQS Configuration
         self.queue_url = os.getenv('SQS_QUEUE_URL', 'https://sqs.us-east-1.amazonaws.com/221082194281/test-video-quote-engine-queue')
         self.sqs_wait_time_seconds = int(os.environ.get("SQS_WAIT_TIME_SECONDS", "20"))

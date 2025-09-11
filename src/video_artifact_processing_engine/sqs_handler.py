@@ -7,6 +7,7 @@ import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 import asyncio
+import os
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -230,9 +231,16 @@ class SQSPoller:
             max_messages: Maximum messages to receive per poll
         """
         self.is_running = True
-        empty_poll_count = 0  # Track consecutive empty polls
         logger.info("Starting SQS polling...")
-        
+
+        # Fargate-friendly idle behavior: do not exit on empty polls by default.
+        # Use exponential backoff with jitter between polls when empty.
+        # Allow opting into legacy stop-on-idle via env STOP_ON_IDLE=true.
+        stop_on_idle = str(os.environ.get('STOP_ON_IDLE', 'false')).lower() in ('1', 'true', 'yes')
+        backoff_base = max(1.0, float(os.environ.get('SQS_EMPTY_BACKOFF_BASE', '1')))
+        backoff_max = max(backoff_base, float(os.environ.get('SQS_EMPTY_BACKOFF_MAX', '20')))
+        backoff = backoff_base
+
         while self.is_running:
             # If draining requested, stop before pulling new work
             if self.draining:
@@ -241,18 +249,24 @@ class SQSPoller:
             try:
                 messages = self.receive_messages(max_messages)
                 if not messages:
-                    logger.debug("No messages received, continuing polling...")
-                    time.sleep(20)  # Wait before retrying
-                    empty_poll_count += 1
-                    if empty_poll_count >= 3:
-                        logger.info("Stopping polling after 3 consecutive empty polls.")
+                    # No messages: apply async backoff with jitter; don’t block the event loop
+                    jitter = 0.25 * backoff
+                    sleep_s = min(backoff_max, backoff + (jitter * (0.5)))
+                    logger.debug(f"No messages; sleeping {sleep_s:.1f}s before next poll (backoff={backoff:.1f}s)")
+                    await asyncio.sleep(sleep_s)
+                    # Increase backoff exponentially up to max
+                    backoff = min(backoff_max, backoff * 2.0)
+
+                    # Optional legacy behavior to stop after prolonged idle
+                    if stop_on_idle and backoff >= backoff_max:
+                        logger.info("Idle backoff reached max and STOP_ON_IDLE=true; stopping polling.")
                         self.stop_polling()
                         break
                     continue
-                
-                # Reset empty poll count on receiving messages
-                empty_poll_count = 0
-                
+
+                # Reset backoff on activity
+                backoff = backoff_base
+
                 # Process messages in batch
                 await self._process_message_batch(messages, message_handler)
 
@@ -267,7 +281,8 @@ class SQSPoller:
                 break
             except Exception as e:
                 logger.error(f"Error in polling loop: {e}")
-                time.sleep(20)  # Wait before retrying
+                # Async small pause before retry to avoid hot loop
+                await asyncio.sleep(min(20.0, backoff))
     
     async def _process_message_batch(self, messages: List[Dict], message_handler):
         """

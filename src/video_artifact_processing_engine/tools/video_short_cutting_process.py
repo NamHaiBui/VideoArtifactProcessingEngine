@@ -95,7 +95,13 @@ async def process_video_chunks_with_path(
             try:
                 ffmpeg_output = (
                     ffmpeg.input(full_video_path, ss=start_time, t=duration)
-                    .output(chunk_path, vcodec='libx264', acodec='aac', crf=23)
+                    .output(
+                        chunk_path,
+                        vcodec='libx264',
+                        acodec='aac',
+                        crf=23,
+                        preset=getattr(config, 'ffmpeg_preset', 'medium'),
+                    )
                     .overwrite_output()
                 )
                 success, _stderr = await run_ffmpeg_with_retries(ffmpeg_output, f"for chunk {chunk.chunk_id}")

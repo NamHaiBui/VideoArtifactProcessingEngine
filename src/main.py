@@ -282,12 +282,12 @@ def signal_handler(signum, frame):
 
     signal_name = signal.Signals(signum).name
 
-    # Spot-specific graceful handling
-    if spot_mode and signum == signal.SIGTERM:
+    # Graceful handling for ECS service stop/SIGTERM (Fargate & Spot):
+    # Unless explicitly disabled via STRICT_BLOCK_SIGTERM, treat SIGTERM as drain trigger.
+    if (spot_mode or os.environ.get('STRICT_BLOCK_SIGTERM', 'false').lower() not in ('1','true','yes')) and signum == signal.SIGTERM:
         if not spot_termination_imminent:
             spot_termination_imminent = True
-            logging.warning("FARGATE_SPOT interruption notice (SIGTERM) received - initiating expedited drain")
-            logging.warning("Attempting fast voluntary shutdown while finishing any critical session")
+            logging.warning("SIGTERM received - initiating graceful drain (no new SQS fetch) and maintaining protection while critical work completes")
             # Initiate SQS drain (stop fetching new messages) if poller active
             try:
                 global global_sqs_poller
@@ -295,9 +295,19 @@ def signal_handler(signum, frame):
                     global_sqs_poller.initiate_drain("sigterm")
             except Exception as drain_e:
                 logging.warning(f"Failed to initiate SQS drain: {drain_e}")
-            request_voluntary_shutdown()
+            # If there are active critical sessions, ensure ECS task protection remains enabled/extended
+            try:
+                status = task_protection_manager.get_protection_status()
+                if status.get('critical_sessions_count', 0) > 0:
+                    logging.warning("Critical sessions active on SIGTERM - reinforcing ECS task protection extension")
+                    # Add a guard session to keep protection on until completion window is safe
+                    task_protection_manager.add_critical_session("scale_in_guard")
+                else:
+                    logging.info("No critical sessions at SIGTERM; remaining idle awaiting self-invoked shutdown (SIGUSR1)")
+            except Exception as pe:
+                logging.warning(f"Could not query/adjust task protection on SIGTERM: {pe}")
         else:
-            logging.warning("Repeated SIGTERM during Spot drain window - already draining")
+            logging.warning("Repeated SIGTERM during drain window - already draining")
         return
 
     # Original hard protection logic for non-spot contexts
@@ -364,8 +374,8 @@ signal.signal(signal.SIGUSR1, voluntary_shutdown_handler)  # User signal 1 for v
 if spot_mode:
     logging.info("Running in FARGATE_SPOT mode - SIGTERM triggers expedited voluntary shutdown")
 else:
-    logging.info("Enhanced signal handlers registered - EXTERNAL SIGNALS COMPLETELY IGNORED:")
-logging.info("- SIGTERM: Termination request" + (" (SPOT drain trigger)" if spot_mode else " (COMPLETELY IGNORED)"))
+    logging.info("Enhanced signal handlers registered - SIGTERM triggers graceful drain unless STRICT_BLOCK_SIGTERM=true")
+logging.info("- SIGTERM: Termination request" + (" (SPOT drain trigger)" if spot_mode else " (graceful drain trigger)") )
 logging.info("- SIGINT: Interrupt signal (Ctrl+C) (COMPLETELY IGNORED)")
 logging.info("- SIGHUP: Hangup signal (COMPLETELY IGNORED)")
 logging.info("- SIGQUIT: Quit signal (COMPLETELY IGNORED)")
@@ -1032,6 +1042,13 @@ async def poll_and_process_sqs_messages():
         
         # Final wait for any remaining critical sessions
         await _wait_for_critical_sessions_completion()
+
+        # Do not exit on SIGTERM-triggered drain; only exit on voluntary self-invocation (SIGUSR1)
+        if not voluntary_shutdown_requested:
+            logging.info("Polling stopped due to drain, awaiting voluntary shutdown signal (SIGUSR1) to exit...")
+            # Simple wait loop; SIGUSR1 handler sets voluntary_shutdown_requested
+            while not voluntary_shutdown_requested:
+                await asyncio.sleep(1)
         
         logging.info("SQS polling shutdown complete")
 
@@ -1064,6 +1081,12 @@ async def _wait_for_critical_sessions_completion():
         logging.warning(f"Drain timeout reached ({max_wait_time}s). Proceeding with shutdown; residual sessions may be cut.")
     else:
         logging.info(f"Drain completed in {waited_time}s.")
+
+    # If we added a scale_in_guard critical session on SIGTERM, remove it now
+    try:
+        task_protection_manager.remove_critical_session("scale_in_guard")
+    except Exception:
+        pass
 
 def log_processing_stats():
     """Log current processing statistics"""
