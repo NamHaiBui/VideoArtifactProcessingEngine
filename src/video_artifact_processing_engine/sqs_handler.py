@@ -75,13 +75,15 @@ class SQSPoller:
         except NoCredentialsError:
             logger.error("AWS credentials not found. Please configure AWS credentials.")
             raise 
-        
+
         # Queue and local state
         self.queue_url = self.config.queue_url
         self.is_running = False
+        # Drain flag: when set, polling loop stops fetching new messages after current batch / message
+        self.draining = False  # When True, finish current in-flight message then exit loop
         # Local memory for NotReady counts per episodeId
         self.not_ready_counts = {}
-        
+
         logger.info(f"SQS Poller initialized for queue: {self.queue_url}")
 
     def _increment_not_ready(self, episode_id: str) -> int:
@@ -232,6 +234,10 @@ class SQSPoller:
         logger.info("Starting SQS polling...")
         
         while self.is_running:
+            # If draining requested, stop before pulling new work
+            if self.draining:
+                logger.info("Draining active - no further SQS receives; waiting for in-flight work (if any) to finish.")
+                break
             try:
                 messages = self.receive_messages(max_messages)
                 if not messages:
@@ -249,6 +255,11 @@ class SQSPoller:
                 
                 # Process messages in batch
                 await self._process_message_batch(messages, message_handler)
+
+                # If drain was requested during batch, exit after batch completes
+                if self.draining:
+                    logger.info("Draining engaged mid-batch - exiting polling loop after current batch.")
+                    break
 
             except KeyboardInterrupt:
                 logger.info("Received interrupt signal, stopping polling...")
@@ -300,6 +311,9 @@ class SQSPoller:
             logger.info(f"Processing {len(valid_messages)} valid messages")
             
             for msg_data in valid_messages:
+                if self.draining:
+                    logger.info("Drain flag set - skipping remaining messages in batch.")
+                    break
                 parsed_message = msg_data['parsed_message']
                 receipt_handle = msg_data['receipt_handle']
                 message_body = msg_data['message_body']
@@ -478,6 +492,14 @@ class SQSPoller:
         """Stop the polling loop."""
         self.is_running = False
         logger.info("SQS polling stopped")
+
+    def initiate_drain(self, reason: str = "signal"):
+        """Request graceful drain: finish current message, stop fetching new ones."""
+        if not self.draining:
+            self.draining = True
+            logger.warning(f"SQS poller drain initiated (reason={reason})")
+        # Ensure main loop will exit soon
+        self.is_running = True  # keep True until loop notice; do not hard-stop to allow in-flight completion
     
     def health_check(self) -> bool:
         """

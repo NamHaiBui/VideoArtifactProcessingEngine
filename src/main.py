@@ -26,12 +26,89 @@ from video_artifact_processing_engine.sqs_handler import SQSPoller, VideoProcess
 logging = setup_custom_logger(__name__)
 cloudwatch_client = create_aws_client_with_retries('cloudwatch')
 
+# Namespace for custom integrity metrics (configure alarm on these metrics in CloudWatch)
+METRIC_NAMESPACE = os.environ.get('METRIC_NAMESPACE', 'VideoArtifactProcessingEngine/Integrity')
+
+def emit_zero_artifact_metric(kind: str, episode_id: str):
+    """Emit a CloudWatch metric indicating an impossible zero-artifact condition.
+
+    kind: 'Quotes' or 'Chunks'
+    Creates (MetricName: ZeroQuotes|ZeroChunks, Dimension: EpisodeId)
+    An associated CloudWatch Alarm should be configured externally to alert when Value > 0.
+    """
+    try:
+        cloudwatch_client.put_metric_data(
+            Namespace=METRIC_NAMESPACE,
+            MetricData=[
+                {
+                    'MetricName': f'Zero{kind}',
+                    'Dimensions': [
+                        {'Name': 'EpisodeId', 'Value': str(episode_id)}
+                    ],
+                    'Timestamp': datetime.utcnow(),
+                    'Value': 1,
+                    'Unit': 'Count'
+                }
+            ]
+        )
+        logging.error(f"ALARM METRIC EMITTED: Zero{kind} for episode {episode_id} (this should never happen)")
+    except Exception as e:
+        logging.error(f"Failed to emit CloudWatch metric Zero{kind} for episode {episode_id}: {e}")
+
+def emit_error_metric(error_type: str, episode_id: str | None = None):
+    """Emit a CloudWatch metric for any processing error condition.
+
+    MetricName: ProcessingError
+    Dimensions:
+      - ErrorType (always)
+      - EpisodeId (when available)
+    """
+    dimensions = [{'Name': 'ErrorType', 'Value': error_type[:100]}]
+    if episode_id:
+        dimensions.append({'Name': 'EpisodeId', 'Value': str(episode_id)})
+    try:
+        cloudwatch_client.put_metric_data(
+            Namespace=METRIC_NAMESPACE,
+            MetricData=[
+                {
+                    'MetricName': 'ProcessingError',
+                    'Dimensions': dimensions,
+                    'Timestamp': datetime.utcnow(),
+                    'Value': 1,
+                    'Unit': 'Count'
+                }
+            ]
+        )
+        logging.error(f"ERROR METRIC EMITTED: {error_type} episode={episode_id}")
+    except Exception as e:
+        logging.error(f"Failed to emit ProcessingError metric ({error_type}) episode={episode_id}: {e}")
+
 CLEANUP_TEMP_FILES = os.environ.get('CLEANUP_TEMP_FILES', 'true').lower() == 'true'
 
-# Global shutdown flag for graceful shutdown
+# Global shutdown / Spot mode flags
 shutdown_requested = False
-voluntary_shutdown_requested = False  # New flag for voluntary shutdown
+voluntary_shutdown_requested = False  # Voluntary (self) shutdown
 current_processing_session = None
+global_sqs_poller: SQSPoller | None = None  # Set when polling starts
+spot_mode = os.environ.get('FARGATE_SPOT', os.environ.get('CAPACITY_PROVIDER', '')).lower() in ('1', 'true', 'yes', 'fargate_spot')
+# Try automatic detection from ECS metadata (CapacityProviderName) if not explicitly set
+if not spot_mode:
+    try:
+        meta_v4 = os.environ.get('ECS_CONTAINER_METADATA_URI_V4')
+        if meta_v4:
+            try:  # optional import guard
+                import requests  # type: ignore
+            except Exception:
+                requests = None  # type: ignore
+            if requests:
+                r = requests.get(f"{meta_v4}/task", timeout=1.5)
+                if r.ok:
+                    cp_name = r.json().get('CapacityProviderName') or ''
+                    if isinstance(cp_name, str) and 'spot' in cp_name.lower():
+                        spot_mode = True
+    except Exception:
+        pass
+spot_termination_imminent = False  # Set when we detect a Spot-driven SIGTERM
 
 # Application state management for shutdown control
 class ApplicationState:
@@ -196,41 +273,44 @@ def voluntary_shutdown_handler(signum, frame):
         logging.error("Check application state and shutdown policy configuration")
 
 def signal_handler(signum, frame):
-    """Handle shutdown signals - COMPLETELY IGNORE all external shutdown requests"""
-    global shutdown_requested, current_processing_session, task_protection_manager, app_state
-    
+    """Handle shutdown signals.
+
+    For on-demand tasks: ignore (policy).
+    For Fargate SPOT: treat SIGTERM as interruption notice -> initiate expedited voluntary shutdown.
+    """
+    global shutdown_requested, current_processing_session, task_protection_manager, app_state, spot_mode, spot_termination_imminent
+
     signal_name = signal.Signals(signum).name
-    
-    # Check if external shutdown is allowed (it never is for this application)
-    if not app_state.request_shutdown(f"external_signal_{signal_name}"):
-        logging.error(f"EXTERNAL SHUTDOWN SIGNAL COMPLETELY BLOCKED: {signal_name}")
-        logging.error("This application has external shutdown protection enabled")
-        logging.error("Signal ignored to maintain application and data integrity")
-        
-        # Get current protection status for logging
-        protection_status = task_protection_manager.get_protection_status()
-        
-        if protection_status['ecs_available']:
-            if protection_status['protection_enabled']:
-                logging.error("ECS task protection is ACTIVE - AWS will block termination attempts")
-                logging.info(f"Protection active for: {protection_status.get('protection_duration_seconds', 0):.1f}s")
-            else:
-                logging.error("ECS task protection should be active - enabling emergency protection")
-                task_protection_manager.add_critical_session("emergency_protection")
-                logging.warning("Emergency protection enabled")
-        
-        # Log current critical sessions
-        if protection_status['critical_sessions_count'] > 0:
-            logging.error(f"Active critical sessions: {protection_status['critical_sessions']}")
+
+    # Spot-specific graceful handling
+    if spot_mode and signum == signal.SIGTERM:
+        if not spot_termination_imminent:
+            spot_termination_imminent = True
+            logging.warning("FARGATE_SPOT interruption notice (SIGTERM) received - initiating expedited drain")
+            logging.warning("Attempting fast voluntary shutdown while finishing any critical session")
+            # Initiate SQS drain (stop fetching new messages) if poller active
+            try:
+                global global_sqs_poller
+                if global_sqs_poller:
+                    global_sqs_poller.initiate_drain("sigterm")
+            except Exception as drain_e:
+                logging.warning(f"Failed to initiate SQS drain: {drain_e}")
+            request_voluntary_shutdown()
         else:
-            logging.error("No active critical sessions, but external shutdown still blocked by policy")
-        
-        logging.error(f"SIGNAL {signal_name} COMPLETELY IGNORED - Use SIGUSR1 for voluntary shutdown")
+            logging.warning("Repeated SIGTERM during Spot drain window - already draining")
         return
-    
-    # This code should never be reached due to application policy
-    logging.critical(f"UNEXPECTED: External shutdown signal {signal_name} was not blocked!")
-    logging.critical("This indicates a bug in the shutdown protection logic")
+
+    # Original hard protection logic for non-spot contexts
+    if not app_state.request_shutdown(f"external_signal_{signal_name}"):
+        logging.error(f"EXTERNAL SHUTDOWN SIGNAL BLOCKED: {signal_name}")
+        protection_status = task_protection_manager.get_protection_status()
+        if protection_status['ecs_available'] and not protection_status['protection_enabled']:
+            task_protection_manager.add_critical_session("emergency_protection")
+            logging.warning("Emergency protection enabled")
+        logging.error(f"SIGNAL {signal_name} IGNORED - Use SIGUSR1 for voluntary shutdown")
+        return
+
+    logging.critical(f"UNEXPECTED: external signal {signal_name} passed protection gate")
     return
 
 def request_voluntary_shutdown():
@@ -271,20 +351,21 @@ def cleanup_on_exit():
     shutdown_task_protection_manager()
     logging.info("Task protection cleanup complete")
 
-# Register signal handlers for graceful shutdown with enhanced protection
+ # Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
-
-# Also handle other potential shutdown signals
-signal.signal(signal.SIGHUP, signal_handler)   # Hangup signal
-signal.signal(signal.SIGQUIT, signal_handler)  # Quit signal
+signal.signal(signal.SIGHUP, signal_handler)
+signal.signal(signal.SIGQUIT, signal_handler)
 
 # Register voluntary shutdown signal
 signal.signal(signal.SIGUSR1, voluntary_shutdown_handler)  # User signal 1 for voluntary shutdown
 
 # Log signal handler registration
-logging.info("Enhanced signal handlers registered - EXTERNAL SIGNALS COMPLETELY IGNORED:")
-logging.info("- SIGTERM: Termination request (COMPLETELY IGNORED)")
+if spot_mode:
+    logging.info("Running in FARGATE_SPOT mode - SIGTERM triggers expedited voluntary shutdown")
+else:
+    logging.info("Enhanced signal handlers registered - EXTERNAL SIGNALS COMPLETELY IGNORED:")
+logging.info("- SIGTERM: Termination request" + (" (SPOT drain trigger)" if spot_mode else " (COMPLETELY IGNORED)"))
 logging.info("- SIGINT: Interrupt signal (Ctrl+C) (COMPLETELY IGNORED)")
 logging.info("- SIGHUP: Hangup signal (COMPLETELY IGNORED)")
 logging.info("- SIGQUIT: Quit signal (COMPLETELY IGNORED)")
@@ -545,6 +626,7 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         except Exception as e:
             logger.error(f"RDS query failed: {e}")
             logger.error(f"Query details - episode_id: {episode_id}")
+            emit_error_metric('EpisodeLookupFailure', episode_id)
             raise e
         
         if not episode_item or (episode_item.content_type and episode_item.content_type.lower() != 'video'):
@@ -557,6 +639,7 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         processing_info = get_episode_processing_status(episode_id)
         if not processing_info:
             logger.error(f"No chunking status found for episode: {episode_id}")
+            emit_error_metric('MissingProcessingStatus', episode_id)
             session.processing_status = 'failed'
             return 'Failed'
         
@@ -566,6 +649,7 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         podcast_title = str(episode_item.channel_name)
         if not s3_http_link:
             logger.error(f"No videoLocation found for episode {episode_id}")
+            emit_error_metric('MissingVideoLocation', episode_id)
             session.processing_status = 'failed'
             return 'Success'
         s3_parsed = parse_s3_url(s3_http_link)
@@ -574,6 +658,7 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         s3_video_key = s3_key + s3_parsed['filename'] if s3_parsed and s3_key else None
         if not s3_video_key:
             logger.error(f"No video key found for episode {episode_id}")
+            emit_error_metric('MissingVideoKey', episode_id)
             session.processing_status = 'failed'
             return 'Failed'
         if s3_video_bucket and s3_video_bucket != config.video_bucket:
@@ -582,11 +667,13 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         
         if not podcast_title or not episode_title:
             logger.error(f"Missing required titles: podcast_title='{podcast_title}', episode_title='{episode_title}'")
+            emit_error_metric('MissingTitles', episode_id)
             session.processing_status = 'failed'
             return 'Failed'
             
         if not s3_key:
             logger.error(f"No video file found for episode {episode_id}")
+            emit_error_metric('MissingS3Key', episode_id)
             session.processing_status = 'failed'
             return 'Failed'
         quotes = []
@@ -602,6 +689,10 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                 logger.info(f"Quote lengths: min={min(quote_lengths)}, max={max(quote_lengths)}, avg={sum(quote_lengths)/len(quote_lengths):.2f}")
                 zero_length_count = sum(1 for x in quote_lengths if x == 0.0)
                 logger.info(f"Quotes with 0.0 length: {zero_length_count}/{len(all_quotes)}")
+            else:
+                # Impossible condition per business invariant -> emit metric & continue (will mark as success to avoid poison loop)
+                emit_zero_artifact_metric('Quotes', episode_id)
+                emit_error_metric('ZeroQuotesUnexpected', episode_id)
 
         chunks = []
         all_chunks = []
@@ -615,9 +706,22 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                 logger.info(f"Chunk lengths: min={min(chunk_lengths)}, max={max(chunk_lengths)}, avg={sum(chunk_lengths)/len(chunk_lengths):.2f}")
                 zero_length_count = sum(1 for x in chunk_lengths if x == 0.0)
                 logger.info(f"Chunks with 0.0 length: {zero_length_count}/{len(all_chunks)}")
+            else:
+                emit_zero_artifact_metric('Chunks', episode_id)
+                emit_error_metric('ZeroChunksUnexpected', episode_id)
 
         # If both categories already complete, short-circuit
         if processing_info.get("videoChunkingDone", False) and processing_info.get("videoQuotingDone", False):
+            # Defensive invariant check: ensure non-zero artifacts existed historically
+            try:
+                if not all_quotes:
+                    emit_zero_artifact_metric('Quotes', episode_id)
+                    emit_error_metric('ZeroQuotesAlreadyProcessed', episode_id)
+                if not all_chunks:
+                    emit_zero_artifact_metric('Chunks', episode_id)
+                    emit_error_metric('ZeroChunksAlreadyProcessed', episode_id)
+            except Exception:
+                pass
             logger.warning("Episodes are already processed")
             return 'Success'
 
@@ -638,11 +742,19 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         # If nothing is pending in either category, finalize flags if DB reflects completion
         if not quotes_to_process and not chunks_to_process:
             try:
+                # Invariant enforcement: emit metrics if zero artifacts unexpectedly
+                if processing_info.get("quotingDone", None) and not all_quotes:
+                    emit_zero_artifact_metric('Quotes', episode_id)
+                    emit_error_metric('ZeroQuotesFinalize', episode_id)
+                if processing_info.get("chunkingDone", None) and not all_chunks:
+                    emit_zero_artifact_metric('Chunks', episode_id)
+                    emit_error_metric('ZeroChunksFinalize', episode_id)
                 # Confirm all are processed in DB before flipping
                 quotes_all_done = _all_quotes_processed(all_quotes) if all_quotes else True
                 chunks_all_done = _all_chunks_processed(all_chunks) if all_chunks else True
                 if quotes_all_done or chunks_all_done:
-                    want_q = bool(quotes_all_done)
+                    # Do NOT set videoQuotingDone if there are zero quotes (business rule)
+                    want_q = bool(quotes_all_done) and len(all_quotes) > 0
                     want_c = bool(chunks_all_done)
                     logger.info("No pending items; ensuring processing flags reflect completion.")
                     # Ensure episode contentType is video via minimal episode update only if needed
@@ -760,6 +872,11 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                     want_q = _all_quotes_processed(final_quotes) if final_quotes or processing_info.get("quotingDone", None) else False
                     want_c = _all_chunks_processed(final_chunks) if final_chunks or processing_info.get("chunkingDone", None) else False
 
+                    # Enforce: don't set quoting done if zero quotes actually exist
+                    if want_q and len(final_quotes) == 0:
+                        logging.warning("Suppressing videoQuotingDone flag because zero quotes present (invariant violation detected earlier)")
+                        want_q = False
+
                     if want_q or want_c:
                         logger.info(f"Ensuring processing flags set: videoQuotingDone={want_q}, videoChunkingDone={want_c}")
                         # Ensure episode content type is set to video; update minimally if needed
@@ -769,7 +886,6 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                                 update_episode_item(episode_item)
                             except Exception as ue:
                                 logger.warning(f"Failed minimal episode content_type update: {ue}")
-                        # Atomically set only the flags that are done, with retries and read-back validation
                         max_retries = 3
                         for attempt in range(max_retries):
                             try:
@@ -788,6 +904,7 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
                                     await asyncio.sleep(0.5)
                             except Exception as upd_e:
                                 if attempt == max_retries - 1:
+                                    emit_error_metric('UpdateProcessingFlagsFailure', episode_id)
                                     logger.error(f"Failed to update processing flags after retries: {upd_e}")
                                     raise
                                 logger.warning(f"Flag update attempt {attempt+1} error: {upd_e}; retrying...")
@@ -830,6 +947,10 @@ async def process_video_message(message: VideoProcessingMessage) -> str:
         session.set_critical(False)  # Ensure protection is removed on failure
         logger.error(f"Error processing message: {e}")
         logger.exception("Full traceback:")
+        try:
+            emit_error_metric('UnhandledException', session.get_result('meta_data_idx'))
+        except Exception:
+            pass
         session.processing_status = 'failed'
         
         # Update processing statistics
@@ -862,6 +983,9 @@ async def poll_and_process_sqs_messages():
     poller = None
     try:
         poller = SQSPoller(config)
+        # Expose globally for signal handler drain
+        global global_sqs_poller
+        global_sqs_poller = poller
         
         # Test connection
         if not poller.health_check():
@@ -902,6 +1026,9 @@ async def poll_and_process_sqs_messages():
     finally:
         if poller:
             poller.stop_polling()
+        # Clear global reference on exit
+        if global_sqs_poller is poller:
+            global_sqs_poller = None
         
         # Final wait for any remaining critical sessions
         await _wait_for_critical_sessions_completion()
@@ -909,33 +1036,34 @@ async def poll_and_process_sqs_messages():
         logging.info("SQS polling shutdown complete")
 
 async def _wait_for_critical_sessions_completion():
-    """Wait for all critical processing sessions to complete before shutdown"""
-    global task_protection_manager
+    """Wait for critical sessions to finish. Dynamic timeout (Spot vs regular)."""
+    global task_protection_manager, spot_mode, spot_termination_imminent
 
-    max_wait_time = 30  # 30 seconds maximum wait
-    check_interval = 10   # Check every 10 seconds
+    # Base timeouts
+    default_timeout = int(os.environ.get('CRITICAL_SESSION_DRAIN_TIMEOUT', '30'))
+    spot_timeout = int(os.environ.get('SPOT_DRAIN_TIMEOUT', '95'))  # ~100s within 2m window
+    max_wait_time = spot_timeout if (spot_mode and spot_termination_imminent) else default_timeout
+    check_interval = min(10, max(3, max_wait_time // 5))
     waited_time = 0
-    
+
+    logging.info(f"Drain watchdog started (timeout={max_wait_time}s, interval={check_interval}s, spot={spot_mode and spot_termination_imminent})")
+
     while waited_time < max_wait_time:
         protection_status = task_protection_manager.get_protection_status()
         critical_count = protection_status['critical_sessions_count']
-        
         if critical_count == 0:
             logging.info("All critical processing sessions completed. Safe to shutdown.")
             break
-            
-        logging.info(f"Waiting for {critical_count} critical sessions to complete...")
-        logging.info(f"Active sessions: {protection_status['critical_sessions']}")
-        logging.info(f"Waited {waited_time}s of maximum {max_wait_time}s")
-        
+        remaining = max_wait_time - waited_time
+        logging.info(f"Draining {critical_count} critical sessions (remaining budget {remaining}s)...")
+        logging.debug(f"Active sessions: {protection_status['critical_sessions']}")
         await asyncio.sleep(check_interval)
         waited_time += check_interval
-    
+
     if waited_time >= max_wait_time:
-        logging.warning(f"Maximum wait time ({max_wait_time}s) exceeded. Proceeding with shutdown.")
-        logging.warning("Some critical sessions may still be active - this could cause data inconsistency.")
+        logging.warning(f"Drain timeout reached ({max_wait_time}s). Proceeding with shutdown; residual sessions may be cut.")
     else:
-        logging.info(f"Critical sessions completed after {waited_time}s wait.")
+        logging.info(f"Drain completed in {waited_time}s.")
 
 def log_processing_stats():
     """Log current processing statistics"""
