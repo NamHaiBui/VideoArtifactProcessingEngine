@@ -117,6 +117,15 @@ class SQSPoller:
             logger.warning(f"Emitted CloudWatch alarm metric for EpisodeId={episode_id}")
         except Exception as e:
             logger.error(f"Failed to emit CloudWatch metric for EpisodeId={episode_id}: {e}")
+
+    def _both_video_flags_done(self, episode_id: str) -> bool:
+        """Return True only if both videoChunkingDone and videoQuotingDone are True in DB."""
+        try:
+            pi = get_episode_processing_status(episode_id) or {}
+            return bool(pi.get('videoChunkingDone')) and bool(pi.get('videoQuotingDone'))
+        except Exception as e:
+            logger.warning(f"Failed to read processing status for {episode_id}: {e}")
+            return False
     
     def validate_message(self, message_body: str) -> Optional[VideoProcessingMessage]:
         """
@@ -358,6 +367,15 @@ class SQSPoller:
                             self.delete_message(receipt_handle)
                             self.requeue_message(message_body)
                             continue
+                        # Requeue unless BOTH final flags are true
+                        if not self._both_video_flags_done(parsed_message.id):
+                            logger.info(
+                                f"Requeuing message {parsed_message.id} because not both videoChunkingDone and videoQuotingDone are true"
+                            )
+                            self.delete_message(receipt_handle)
+                            self.requeue_message(message_body)
+                            continue
+                        # All done – safe to delete permanently
                         self.delete_message(receipt_handle)
                         # Reset NotReady counter on success
                         self._reset_not_ready(parsed_message.id)
