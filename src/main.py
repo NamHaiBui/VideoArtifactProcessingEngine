@@ -974,6 +974,10 @@ async def poll_and_process_sqs_messages():
     
     if not config.queue_url:
         logging.error("SQS_QUEUE_URL environment variable not set")
+        try:
+            emit_error_metric('MissingQueueUrl')
+        except Exception:
+            pass
         return
     
     logging.info(f"Starting protected SQS polling on queue: {config.queue_url}")
@@ -990,6 +994,10 @@ async def poll_and_process_sqs_messages():
         # Test connection
         if not poller.health_check():
             logging.error("SQS health check failed")
+            try:
+                emit_error_metric('SQSHealthCheckFailed')
+            except Exception:
+                pass
             return
         
         logging.info("SQS poller initialized successfully")
@@ -1023,6 +1031,10 @@ async def poll_and_process_sqs_messages():
     except Exception as e:
         logging.error(f"Error in SQS polling: {e}")
         logging.exception("Full traceback:")
+        try:
+            emit_error_metric('SQSPollingException')
+        except Exception:
+            pass
     finally:
         if poller:
             poller.stop_polling()
@@ -1085,6 +1097,10 @@ async def main():
     logging.info("Starting audio chunking and summarization process...")
     if len(sys.argv) < 2:
         logging.error("No event data received in command-line arguments.")
+        try:
+            emit_error_metric('CliNoEvent')
+        except Exception:
+            pass
         return {
             'statusCode': 500,
             'body': "Error: No event data received in command-line arguments."
@@ -1096,6 +1112,10 @@ async def main():
 
     if not event_data:
         logging.error("No event data received.")
+        try:
+            emit_error_metric('CliEmptyEvent')
+        except Exception:
+            pass
         return {
             'statusCode': 500,
             'body': "Error: No event data received."
@@ -1110,6 +1130,10 @@ async def main():
 
     except KeyError as e:
         print(f"Missing key in event data: {e}")
+        try:
+            emit_error_metric('CliParseError')
+        except Exception:
+            pass
         return {
             'statusCode': 500,
             'body': f"Error: {str(e)}"
@@ -1142,6 +1166,10 @@ async def main():
             }
         else:
             logging.error(f"Video processing failed for {meta_data_idx}")
+            try:
+                emit_error_metric('CliProcessingFailed', meta_data_idx)
+            except Exception:
+                pass
             return {
                 'statusCode': 500,
                 'body': json.dumps({'success': False, 'error': f'Processing failed for {meta_data_idx}'})
@@ -1149,6 +1177,10 @@ async def main():
 
     except Exception as e:
         print(f"Error processing video: {e}")
+        try:
+            emit_error_metric('CliUnhandledException')
+        except Exception:
+            pass
         return {
             'statusCode': 500,
             'body': f"Error: {str(e)}"

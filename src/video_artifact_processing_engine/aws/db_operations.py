@@ -719,7 +719,10 @@ def update_episode_processing_flags(
     video_chunking_done: Optional[bool] = None,
 ) -> bool:
     """Atomically set processingInfo.videoQuotingDone and/or videoChunkingDone using JSONB set.
-    Only updates the flags provided (non-None). Uses advisory lock and retries.
+    Also sets completion timestamps on first transition to True (does not overwrite if already set):
+        - videoQuotingDoneAt (UTC ISO8601)
+        - videoChunkingDoneAt (UTC ISO8601)
+    Only updates the fields provided (non-None). Uses advisory lock and retries.
     """
     if video_quoting_done is None and video_chunking_done is None:
         return True
@@ -735,12 +738,22 @@ def update_episode_processing_flags(
             base_jsonb = "COALESCE(\"processingInfo\", '{}'::jsonb)"
             params = []
             expr = base_jsonb
+            # Use a single 'now' timestamp for consistency in one update
+            now_iso = datetime.utcnow().isoformat() + 'Z'
             if video_quoting_done is not None:
                 expr = f"jsonb_set({expr}, '{{videoQuotingDone}}', to_jsonb(%s), true)"
                 params.append(video_quoting_done)
+                if bool(video_quoting_done):
+                    # Set videoQuotingDoneAt only if not already present
+                    expr = f"CASE WHEN ({expr} ? 'videoQuotingDoneAt') THEN {expr} ELSE jsonb_set({expr}, '{{videoQuotingDoneAt}}', to_jsonb(%s), true) END"
+                    params.append(now_iso)
             if video_chunking_done is not None:
                 expr = f"jsonb_set({expr}, '{{videoChunkingDone}}', to_jsonb(%s), true)"
                 params.append(video_chunking_done)
+                if bool(video_chunking_done):
+                    # Set videoChunkingDoneAt only if not already present
+                    expr = f"CASE WHEN ({expr} ? 'videoChunkingDoneAt') THEN {expr} ELSE jsonb_set({expr}, '{{videoChunkingDoneAt}}', to_jsonb(%s), true) END"
+                    params.append(now_iso)
 
             sql = f'''
                 UPDATE "Episodes"

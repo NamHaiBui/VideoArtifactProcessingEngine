@@ -4,6 +4,7 @@ SQS message handling and polling functionality.
 
 import json
 import time
+import os
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 import asyncio
@@ -20,6 +21,7 @@ from video_artifact_processing_engine.aws.db_operations import (
 )
 
 logger = setup_custom_logger(__name__)
+ALERTS_NAMESPACE = os.environ.get('METRIC_NAMESPACE_ALERTS', 'VideoArtifactProcessingEngine/Alerts')
 
 @dataclass
 class VideoProcessingMessage:
@@ -91,7 +93,14 @@ class SQSPoller:
         current = self.not_ready_counts.get(episode_id, 0) + 1
         self.not_ready_counts[episode_id] = current
         return current
-
+    def _both_video_flags_done(self, episode_id: str) -> bool:
+        """Return True only if both videoChunkingDone and videoQuotingDone are True in DB."""
+        try:
+            pi = get_episode_processing_status(episode_id) or {}
+            return bool(pi.get('videoChunkingDone')) and bool(pi.get('videoQuotingDone'))
+        except Exception as e:
+            logger.warning(f"Failed to read processing status for {episode_id}: {e}")
+            return False
     def _reset_not_ready(self, episode_id: str) -> None:
         """Reset the NotReady count for an episode id after success or escalation."""
         if episode_id in self.not_ready_counts:
@@ -101,7 +110,7 @@ class SQSPoller:
         """Emit a CloudWatch metric to trigger alarm for repeated NotReady events."""
         try:
             self.cloudwatch.put_metric_data(
-                Namespace='VideoArtifactProcessingEngine/Alerts',
+                Namespace=ALERTS_NAMESPACE,
                 MetricData=[
                     {
                         'MetricName': 'NotReadyCountExceeded',
@@ -116,6 +125,31 @@ class SQSPoller:
             logger.warning(f"Emitted CloudWatch alarm metric for EpisodeId={episode_id}")
         except Exception as e:
             logger.error(f"Failed to emit CloudWatch metric for EpisodeId={episode_id}: {e}")
+    def _emit_generic_alarm(self, metric_name: str, episode_id: Optional[str] = None, extra_dimensions: Optional[List[Dict]] = None) -> None:
+        """Emit a generic CloudWatch alarm metric for error conditions."""
+        try:
+            dims: List[Dict] = []
+            if episode_id:
+                dims.append({'Name': 'EpisodeId', 'Value': str(episode_id)})
+            if extra_dimensions:
+                for d in extra_dimensions:
+                    n = str(d.get('Name', 'Detail'))[:100]
+                    v = str(d.get('Value', ''))[:240]
+                    dims.append({'Name': n, 'Value': v})
+            self.cloudwatch.put_metric_data(
+                Namespace=ALERTS_NAMESPACE,
+                MetricData=[
+                    {
+                        'MetricName': metric_name,
+                        'Dimensions': dims,
+                        'Unit': 'Count',
+                        'Value': 1.0,
+                    }
+                ]
+            )
+            logger.error(f"ALARM METRIC EMITTED: {metric_name} episode={episode_id} dims={dims}")
+        except Exception as e:
+            logger.error(f"Failed to emit CloudWatch metric {metric_name} for episode {episode_id}: {e}")
     
     def validate_message(self, message_body: str) -> Optional[VideoProcessingMessage]:
         """
@@ -127,13 +161,13 @@ class SQSPoller:
         Returns:
             VideoProcessingMessage if valid, None otherwise
         """
-        #TODO: If the validation fails, raise a Cloudwatch alarm and send to DLQ
         try:
             data = json.loads(message_body)
             
             # Validate required fields
             if 'episodeId' not in data:
                 logger.error("Message missing required 'episodeId' field")
+                self._emit_generic_alarm('InvalidMessage', None, [{'Name': 'Reason', 'Value': 'MissingEpisodeId'}])
                 return None
             
             message = VideoProcessingMessage.from_dict(data)
@@ -142,9 +176,11 @@ class SQSPoller:
             
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in message: {e}")
+            self._emit_generic_alarm('InvalidMessage', None, [{'Name': 'Reason', 'Value': 'JSONDecodeError'}])
             return None
         except Exception as e:
             logger.error(f"Error parsing message: {e}")
+            self._emit_generic_alarm('InvalidMessage', None, [{'Name': 'Reason', 'Value': 'ParseError'}])
             return None
     
     def receive_messages(self, max_messages: int = 10) -> List[Dict]:
@@ -171,9 +207,11 @@ class SQSPoller:
             
         except ClientError as e:
             logger.error(f"Error receiving messages from SQS: {e}")
+            self._emit_generic_alarm('SQSReceiveError', None, [{'Name': 'Stage', 'Value': 'receive_messages'}])
             return []
         except Exception as e:
             logger.error(f"Unexpected error receiving messages: {e}")
+            self._emit_generic_alarm('SQSReceiveError', None, [{'Name': 'Stage', 'Value': 'receive_messages_unexpected'}])
             return []
     
     def delete_message(self, receipt_handle: str) -> bool:
@@ -196,9 +234,11 @@ class SQSPoller:
             
         except ClientError as e:
             logger.error(f"Error deleting message from SQS: {e}")
+            self._emit_generic_alarm('SQSDeleteError')
             return False
         except Exception as e:
             logger.error(f"Unexpected error deleting message: {e}")
+            self._emit_generic_alarm('SQSDeleteError', None, [{'Name': 'Type', 'Value': 'Unexpected'}])
             return False
     
     def requeue_message(self, message_body: str):
@@ -219,6 +259,7 @@ class SQSPoller:
             logger.info("Message requeued successfully")
         except Exception as e:
             logger.error(f"Error requeuing message: {e}")
+            self._emit_generic_alarm('SQSRequeueError')
     
 
     async def start_polling(self, message_handler, max_messages: int = 10):
@@ -267,6 +308,7 @@ class SQSPoller:
                 break
             except Exception as e:
                 logger.error(f"Error in polling loop: {e}")
+                self._emit_generic_alarm('SQSPollingLoopError')
                 time.sleep(20)  # Wait before retrying
     
     async def _process_message_batch(self, messages: List[Dict], message_handler):
@@ -304,6 +346,7 @@ class SQSPoller:
         # Handle invalid messages
         for invalid_msg in invalid_messages:
             logger.error("Invalid message")
+            self._emit_generic_alarm('InvalidMessage', None, [{'Name': 'Stage', 'Value': 'batch_validation'}])
             self.delete_message(invalid_msg['receipt_handle'])
         
         # Process valid messages
@@ -332,17 +375,27 @@ class SQSPoller:
                             await hb_task
                         except asyncio.CancelledError:
                             pass
-                    
+
                     if success == 'Success':
                         logger.info(f"Successfully processed message: {parsed_message.id}")
                         # Ensure flags are set if all corresponding items are already processed
                         flags_ok = await self._ensure_flags_after_success(parsed_message.id)
                         if not flags_ok:
                             logger.warning(f"Flags not set after success for {parsed_message.id}; requeuing message to retry flag update.")
+                            self._emit_generic_alarm('FlagUpdateNotPersisted', parsed_message.id)
                             # Requeue to retry flag update later; delete current message
                             self.delete_message(receipt_handle)
                             self.requeue_message(message_body)
                             continue
+                        # Requeue unless BOTH final flags are true
+                        if not self._both_video_flags_done(parsed_message.id):
+                            logger.info(
+                                f"Requeuing message {parsed_message.id} because not both videoChunkingDone and videoQuotingDone are true"
+                            )
+                            self.delete_message(receipt_handle)
+                            self.requeue_message(message_body)
+                            continue
+                        # All done – safe to delete permanently
                         self.delete_message(receipt_handle)
                         # Reset NotReady counter on success
                         self._reset_not_ready(parsed_message.id)
@@ -361,9 +414,11 @@ class SQSPoller:
                     else:
                         # Let message timeout and return to queue for retry
                         logger.error(f"Message processing failed: {parsed_message.id}")
-                
+                        self._emit_generic_alarm('HandlerReturnedFailed', parsed_message.id)
+
                 except Exception as e:
                     logger.error(f"Error processing message {parsed_message.id}: {e}")
+                    self._emit_generic_alarm('MessageProcessingException', parsed_message.id)
 
     def _is_valid_chunk(self, c) -> bool:
         try:
@@ -475,6 +530,7 @@ class SQSPoller:
                     logger.debug("Extended message visibility timeout via heartbeat")
                 except Exception as e:
                     logger.warning(f"Failed to extend message visibility: {e}")
+                    self._emit_generic_alarm('VisibilityExtendFailed')
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             # Best-effort final extension to give cleanup time (optional)
@@ -517,4 +573,5 @@ class SQSPoller:
             return True
         except Exception as e:
             logger.error(f"Health check failed: {e}")
+            self._emit_generic_alarm('SQSHealthCheckFailed')
             return False
